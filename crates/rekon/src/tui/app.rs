@@ -17,6 +17,7 @@ use rekon_core::model::{Blocks, DirNote, FileNote, Freshness, ProjectNote, fresh
 use rekon_core::scan::{Excluder, Tree};
 use rekon_core::{segment, text};
 
+use super::editor::EditRequest;
 use super::highlight::{self, Lines};
 use super::rows::{self, BlockView, Desc, Row, RowKind, RowRef};
 
@@ -222,6 +223,8 @@ pub struct App {
     last_tick: Instant,
     last_rescan: Instant,
     rescanning: bool,
+    /// Set by `e`; the event loop runs the editor and calls [`App::after_edit`].
+    pub editor_request: Option<EditRequest>,
     pub quit: bool,
     pub dirty: bool,
 }
@@ -279,6 +282,7 @@ impl App {
             last_tick: Instant::now(),
             last_rescan: Instant::now(),
             rescanning: false,
+            editor_request: None,
             quit: false,
             dirty: true,
         })
@@ -401,7 +405,7 @@ impl App {
     }
 
     /// Every 2 s: re-stat visible files and the open file, reload changed notes.
-    fn tick(&mut self) {
+    pub fn tick(&mut self) {
         let (start, end) = (
             self.tree_panel.offset,
             self.tree_panel.offset + self.tree_panel.height(),
@@ -625,6 +629,8 @@ impl App {
             }
             KeyCode::Char('o') => self.desc_only = !self.desc_only,
             KeyCode::Char('r') => self.regenerate(),
+            KeyCode::Char('R') => self.start_init(),
+            KeyCode::Char('e') => self.request_editor(),
             KeyCode::Tab | KeyCode::BackTab => {
                 self.focus = match self.focus {
                     Focus::Tree if !self.wide => Focus::Code,
@@ -879,9 +885,36 @@ impl App {
         });
     }
 
-    /// `r`: regenerates the selected block's split (code panel) or the file's blocks.
+    /// Queues a description of a file or folder with the current tree.
+    fn submit_summary(&mut self, path: &str, is_dir: bool, force: bool) {
+        let ctx = Arc::clone(&self.ctx);
+        let tree = self.tree.clone();
+        let paths = vec![path.to_string()];
+        if is_dir {
+            self.pool.submit(JobKey::DirSummary(path.to_string()), move || {
+                init::describe_dirs(&ctx, &tree, &paths, force).map(|_| ())
+            });
+        } else {
+            self.pool.submit(JobKey::FileSummary(path.to_string()), move || {
+                init::describe_files(&ctx, &tree, &paths, force).map(|_| ())
+            });
+        }
+    }
+
+    /// `r`: in the tree regenerates the selected description; in the code panel the
+    /// selected block's split (or the file's blocks).
     fn regenerate(&mut self) {
-        if self.focus != Focus::Code {
+        if self.focus == Focus::Tree {
+            let Some(path) = self.selected_tree_path().map(str::to_string) else {
+                return;
+            };
+            let Some(i) = self.tree.get(&path) else { return };
+            let node = self.tree.node(i);
+            if node.is_dir {
+                self.submit_summary(&path, true, true);
+            } else if node.file.as_ref().is_some_and(|f| f.is_text()) {
+                self.submit_summary(&path, false, true);
+            }
             return;
         }
         let Some(open) = &self.open else { return };
@@ -902,6 +935,54 @@ impl App {
             }
             Some(_) => {}
             None => self.submit_level1(&path, true),
+        }
+    }
+
+    // ----- editor -----
+
+    /// `e`: asks the event loop to suspend the TUI and run the editor on the open file
+    /// (at the selected block) or on the file selected in the tree.
+    fn request_editor(&mut self) {
+        let (path, line) = match (self.focus, &self.open) {
+            (Focus::Code, Some(open)) => (open.path.clone(), self.selected_block().map_or(1, |r| r.0)),
+            _ => match self.selected_tree_path().and_then(|p| self.tree.get(p)) {
+                Some(i) if !self.tree.node(i).is_dir => (self.tree.node(i).path.clone(), 1),
+                _ => return,
+            },
+        };
+        let abs = self.ctx.root.join(&path);
+        let hash_before = rekon_core::hash::hash_file(&abs).ok();
+        self.editor_request = Some(EditRequest {
+            path,
+            abs,
+            line,
+            hash_before,
+        });
+    }
+
+    /// After the editor returns: reload, and when the file changed describe it and
+    /// split it again right away.
+    pub fn after_edit(&mut self, req: EditRequest, result: anyhow::Result<()>) {
+        self.dirty = true;
+        if let Err(e) = result {
+            self.error(format!("editor: {e:#}"));
+        }
+        if let Some(i) = self.tree.get(&req.path) {
+            self.tree
+                .refresh_file(i, &self.ctx.root, &self.ctx.config, &self.excluder);
+        }
+        if self.open.as_ref().is_some_and(|o| o.path == req.path) {
+            self.reload_open(&req.path);
+        }
+        let hash_after = rekon_core::hash::hash_file(&req.abs).ok();
+        if hash_after.is_some() && hash_after != req.hash_before {
+            self.submit_summary(&req.path, false, false);
+            let fits = self.open.as_ref().is_some_and(|o| {
+                o.path == req.path && o.problem.is_none() && o.lines.len() as u32 <= self.ctx.config.max_segment_lines
+            });
+            if fits {
+                self.submit_level1(&req.path, false);
+            }
         }
     }
 

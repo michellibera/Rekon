@@ -496,3 +496,112 @@ fn apply_from_outside_shows_after_refresh() {
             .contains(&"    util.rs  Helpers from an agent".to_string())
     );
 }
+
+fn wait_init(fx: &mut Fixture) {
+    let started = std::time::Instant::now();
+    while fx.app.init.is_some() {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "init did not finish"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        fx.app.poll();
+    }
+}
+
+#[test]
+fn edit_that_changes_the_file_redescribes_and_resplits_it() {
+    let mut fx = fixture(100, 24);
+    fx.open_main();
+    let abs = fx.dir.path().join("src/main.rs");
+    let req = super::editor::EditRequest {
+        path: "src/main.rs".into(),
+        abs: abs.clone(),
+        line: 1,
+        hash_before: rekon_core::hash::hash_file(&abs).ok(),
+    };
+    std::fs::write(
+        &abs,
+        "fn main() {}
+
+fn edited() {}
+",
+    )
+    .unwrap();
+    fx.app.after_edit(req, Ok(()));
+    fx.wait_jobs();
+    let note = fx.app.ctx.store.file_note("src/main.rs");
+    assert_eq!(note.summary.unwrap().text, "Opis testowy: src/main.rs");
+    assert_eq!(note.blocks.unwrap().items.last().unwrap().lines.1, 3);
+    assert!(fx.code_lines().iter().any(|l| l.contains("fn edited() {}")));
+}
+
+#[test]
+fn edit_without_changes_calls_nothing() {
+    let mut fx = fixture(100, 24);
+    fx.open_main();
+    let calls = fx.fake.call_count();
+    let abs = fx.dir.path().join("src/main.rs");
+    let req = super::editor::EditRequest {
+        path: "src/main.rs".into(),
+        abs: abs.clone(),
+        line: 1,
+        hash_before: rekon_core::hash::hash_file(&abs).ok(),
+    };
+    fx.app.after_edit(req, Ok(()));
+    fx.wait_jobs();
+    assert_eq!(fx.fake.call_count(), calls);
+}
+
+#[test]
+fn file_changed_outside_gets_warning_and_capital_r_refreshes_it() {
+    let mut fx = fixture(100, 24);
+    fx.app.expanded.insert("src".into());
+    assert!(fx.tree_lines().contains(&"    main.rs  Starts the program".to_string()));
+    write(
+        fx.dir.path(),
+        "src/main.rs",
+        "fn main() { changed(); }
+",
+    );
+    fx.app.tick();
+    assert!(
+        fx.tree_lines().contains(&"  ⚠ main.rs  Starts the program".to_string()),
+        "{:?}",
+        fx.tree_lines()
+    );
+    fx.key(KeyCode::Char('R'));
+    assert!(fx.app.init.is_some());
+    wait_init(&mut fx);
+    let lines = fx.tree_lines();
+    assert!(
+        lines.contains(&"    main.rs  Opis testowy: src/main.rs".to_string()),
+        "{lines:?}"
+    );
+    assert!(
+        lines.contains(&"    util.rs  Opis testowy: src/util.rs".to_string()),
+        "missing ones too: {lines:?}"
+    );
+}
+
+#[test]
+fn r_in_tree_regenerates_the_selected_description() {
+    let mut fx = fixture(100, 24);
+    fx.app.expanded.insert("src".into());
+    fx.draw();
+    fx.key(KeyCode::Down); // src/lib.rs (stale, by agent)
+    fx.draw();
+    assert_eq!(fx.app.selected_tree_path(), Some("src/lib.rs"));
+    fx.key(KeyCode::Char('r'));
+    fx.wait_jobs();
+    assert!(
+        fx.tree_lines()
+            .contains(&"    lib.rs  Opis testowy: src/lib.rs".to_string())
+    );
+    fx.key(KeyCode::Up); // src/ folder
+    fx.draw();
+    fx.key(KeyCode::Char('r'));
+    fx.wait_jobs();
+    assert!(fx.tree_lines().contains(&"▾ src/  Opis testowy: src".to_string()));
+    assert_eq!(fx.app.errors, 0, "{:?}", fx.app.last_error);
+}

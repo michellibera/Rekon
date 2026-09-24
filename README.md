@@ -29,7 +29,31 @@ rekon show src/main.rs  # note of a file, with blocks
 rekon segment src/main.rs [--lines 15-40]
 ```
 
-`REKON_BACKEND=fake` answers deterministically without a model (tests, UI work).
+`REKON_BACKEND=fake` answers deterministically without a model (tests, UI work);
+`REKON_FAKE_DELAY_MS=800` makes it slow enough to see progress markers.
+
+### TUI
+
+`rekon` without a subcommand opens the TUI (a missing map is built in the background).
+
+| Key | Action |
+| --- | --- |
+| ↑/↓, k/j | previous/next item (code panel: block header) |
+| →/l, Enter | expand folder, open file, expand block |
+| ←/h | collapse or go to parent |
+| Tab | switch panel |
+| PgUp/PgDn | scroll by a page |
+| o | descriptions only in the code panel |
+| w | tree at full width |
+| i | project overview |
+| e | open `$EDITOR` at the selected block |
+| r | regenerate the selected item |
+| R | refresh all outdated tree descriptions |
+| ? | help |
+| q | quit |
+
+Mouse: a click selects and expands or collapses, the wheel scrolls the panel under the cursor.
+`⚠` marks a description older than the code.
 
 ### With Claude Code
 

@@ -143,3 +143,35 @@ fn session_start_prints_overview_and_two_levels() {
     assert!(out.contains("Cargo.lock — Skipped (*.lock)"), "{out}");
     assert!(out.lines().count() <= 153);
 }
+
+#[test]
+fn automatic_result_does_not_overwrite_agent_written_meanwhile() {
+    let dir = repo();
+    let root = dir.path().to_path_buf();
+    rekon_core::init::prepare(&root).unwrap();
+    let fake = std::sync::Arc::new(rekon_core::backend::fake::FakeBackend {
+        delay: std::time::Duration::from_millis(400),
+        ..Default::default()
+    });
+    let config = rekon_core::config::Config {
+        backend: "fake".into(),
+        ..Default::default()
+    };
+    let ctx = std::sync::Arc::new(rekon_core::Ctx::with_backend(&root, config, fake));
+    let (tree, _) = rekon_core::scan::Tree::scan(&root, &ctx.config).unwrap();
+    let job = {
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            rekon_core::init::describe_files(&ctx, &tree, &["src/main.rs".to_string()], false).unwrap()
+        })
+    };
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let input = apply::parse(r#"{"summaries": {"src/main.rs": "Written by the agent"}}"#).unwrap();
+    apply::apply(&ctx, &input, Author::Agent).unwrap();
+    assert_eq!(job.join().unwrap(), 0, "the automatic result is dropped");
+    let summary = ctx.store.file_note("src/main.rs").summary.unwrap();
+    assert_eq!(
+        (summary.text.as_str(), summary.by),
+        ("Written by the agent", Author::Agent)
+    );
+}
