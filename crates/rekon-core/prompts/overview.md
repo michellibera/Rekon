@@ -1,0 +1,1 @@
+Write an overview of the project in 3-5 sentences (field "overview") and a one-sentence description of the whole project (field "summary"). The input on stdin lists all paths with line counts, then the README and the manifests.

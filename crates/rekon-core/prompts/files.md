@@ -1,0 +1,1 @@
+Describe in one sentence the role of each file listed under "FILES TO DESCRIBE" within the whole project. Return one entry per file, with "path" exactly as given. The input on stdin has the project overview, the folder, its entries, and the beginning of each file.

@@ -1,0 +1,23 @@
+[package]
+name = "rekon"
+description = "Terminal map of a repository: one-line descriptions of files, folders and code blocks"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "rekon"
+path = "src/main.rs"
+
+[dependencies]
+rekon-core.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+ratatui.workspace = true
+syntect.workspace = true
+shell-words.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

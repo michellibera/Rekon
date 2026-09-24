@@ -1,0 +1,1 @@
+Split lines {start}-{end} into 2-7 logical blocks that together cover the whole range without gaps or overlaps. Give each block "start" and "end" (line numbers, inclusive) and a one-sentence "summary". The code on stdin has line numbers before the "|" separator.
