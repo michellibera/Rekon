@@ -85,10 +85,12 @@ fn panel_block(title: String, focused: bool) -> Block<'static> {
         .border_style(if focused { FOCUS_BORDER } else { Style::new() })
 }
 
-fn code_title(app: &App) -> String {
-    match &app.open {
-        None => text::CODE_TITLE_EMPTY.to_string(),
-        Some(open) => open.path.clone(),
+fn code_title(app: &mut App) -> String {
+    let status = app.blocks_status();
+    match (&app.open, status) {
+        (None, _) => text::CODE_TITLE_EMPTY.to_string(),
+        (Some(open), None) => open.path.clone(),
+        (Some(open), Some(s)) => format!("{} — {s}", open.path),
     }
 }
 

@@ -62,7 +62,8 @@ pub const NO_OVERVIEW: &str = "No overview yet. Run `rekon init` (or wait for th
 pub const SELECT_FILE: &str = "Select a file in the tree to see its code.";
 pub const SPLITTING: &str = "splitting into blocks…";
 pub const HELP_HINT: &str = "? help";
-pub const NOT_TEXT: &str = "not a text file";
+pub const BLOCKS_OUTDATED: &str = "blocks outdated, r splits again";
+pub const NO_BLOCKS: &str = "no blocks, r splits";
 
 pub fn too_long_for_blocks(lines: u32, max: u32) -> String {
     format!("{lines} lines, more than max_segment_lines ({max}): no blocks")

@@ -20,6 +20,7 @@ pub struct Fixture {
     pub dir: tempfile::TempDir,
     pub app: App,
     pub term: Terminal<TestBackend>,
+    pub fake: Arc<FakeBackend>,
 }
 
 fn git(root: &std::path::Path, args: &[&str]) {
@@ -55,7 +56,8 @@ pub fn fixture(width: u16, height: u16) -> Fixture {
         backend: "fake".into(),
         ..Config::default()
     };
-    let ctx = Arc::new(Ctx::with_backend(root, config, Arc::new(FakeBackend::default())));
+    let fake = Arc::new(FakeBackend::default());
+    let ctx = Arc::new(Ctx::with_backend(root, config, fake.clone()));
     let (tree, _) = Tree::scan(root, &ctx.config).unwrap();
     let s = &ctx.store;
     let key = |p: &str| s.file_key(p).unwrap();
@@ -99,9 +101,9 @@ pub fn fixture(width: u16, height: u16) -> Fixture {
         Some("Overview text."),
     )
     .unwrap();
-    let app = App::for_tests(ctx, tree);
+    let app = App::with_tree(ctx, tree).unwrap();
     let term = Terminal::new(TestBackend::new(width, height)).unwrap();
-    Fixture { dir, app, term }
+    Fixture { dir, app, term, fake }
 }
 
 impl Fixture {
@@ -139,6 +141,194 @@ impl Fixture {
     pub fn key(&mut self, code: KeyCode) {
         self.app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
     }
+
+    /// Waits until the job pool is idle and its results are handled.
+    pub fn wait_jobs(&mut self) {
+        let started = std::time::Instant::now();
+        while self.app.pool.pending_count() > 0 {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(10),
+                "jobs did not finish"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            self.app.poll();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        self.app.poll();
+    }
+
+    /// Rows of the code panel, trimmed.
+    pub fn code_lines(&mut self) -> Vec<String> {
+        let screen = self.draw();
+        let a = self.app.code_panel.area;
+        screen[a.y as usize..(a.y + a.height) as usize]
+            .iter()
+            .map(|l| {
+                l.chars()
+                    .skip(a.x as usize)
+                    .take(a.width as usize)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .filter(|l| !l.is_empty())
+            .collect()
+    }
+
+    /// Opens src/main.rs from the tree and waits for its level-1 blocks.
+    pub fn open_main(&mut self) {
+        self.app.expanded.insert("src".into());
+        self.draw();
+        self.app.open_file("src/main.rs");
+        self.wait_jobs();
+        self.key(KeyCode::Tab);
+    }
+}
+
+#[test]
+fn opening_a_file_splits_it_once() {
+    let mut fx = fixture(100, 24);
+    fx.open_main();
+    assert_eq!(fx.fake.call_count(), 1);
+    assert_eq!(
+        fx.code_lines(),
+        [
+            "▸ 1–4  Opis testowy: linie 1-4",
+            "│    1 fn main() {",
+            "│    2     run();",
+            "│    3 }",
+            "│    4",
+            "· 5–5  Opis testowy: linie 5-5",
+            "│    5 fn run() {}",
+        ]
+    );
+    // Opening again reads the note.
+    fx.app.open_file("src/main.rs");
+    fx.wait_jobs();
+    fx.draw();
+    assert_eq!(fx.fake.call_count(), 1);
+}
+
+#[test]
+fn expanding_splits_lazily_and_reuses_children() {
+    let mut fx = fixture(100, 24);
+    fx.open_main();
+    fx.draw();
+    fx.key(KeyCode::Right);
+    fx.draw();
+    fx.wait_jobs();
+    assert_eq!(fx.fake.call_count(), 2);
+    assert_eq!(
+        fx.code_lines(),
+        [
+            "▾ 1–4  Opis testowy: linie 1-4",
+            "  · 1–2  Opis testowy: linie 1-2",
+            "  │    1 fn main() {",
+            "  │    2     run();",
+            "  · 3–4  Opis testowy: linie 3-4",
+            "  │    3 }",
+            "  │    4",
+            "· 5–5  Opis testowy: linie 5-5",
+            "│    5 fn run() {}",
+        ]
+    );
+    fx.key(KeyCode::Left); // collapse
+    fx.draw();
+    fx.key(KeyCode::Right); // expand again from the note
+    fx.draw();
+    fx.wait_jobs();
+    assert_eq!(fx.fake.call_count(), 2);
+    assert!(fx.code_lines()[0].starts_with("▾ 1–4"));
+}
+
+#[test]
+fn selection_jumps_between_headers_and_o_hides_code() {
+    let mut fx = fixture(100, 24);
+    fx.open_main();
+    fx.draw();
+    assert_eq!(fx.app.code_panel.sel, 0);
+    fx.key(KeyCode::Down);
+    fx.draw();
+    assert_eq!(fx.app.code_panel.sel, 5, "next header, over the code lines");
+    fx.key(KeyCode::Up);
+    fx.draw();
+    assert_eq!(fx.app.code_panel.sel, 0);
+    let footer = fx.draw().join(
+        "
+",
+    );
+    assert!(footer.contains("src/main.rs:1–4 — Opis testowy: linie 1-4"), "{footer}");
+    fx.key(KeyCode::Char('o'));
+    assert_eq!(
+        fx.code_lines(),
+        ["▸ 1–4  Opis testowy: linie 1-4", "· 5–5  Opis testowy: linie 5-5"]
+    );
+}
+
+#[test]
+fn click_on_block_header_toggles_it() {
+    let mut fx = fixture(100, 24);
+    fx.open_main();
+    fx.draw();
+    let area = fx.app.code_panel.area;
+    let click = |row: u16| MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: area.x + 1,
+        row: area.y + row,
+        modifiers: KeyModifiers::NONE,
+    };
+    fx.app.on_mouse(click(0));
+    fx.draw();
+    fx.wait_jobs();
+    assert!(fx.code_lines()[0].starts_with("▾ 1–4"));
+    fx.app.on_mouse(click(0));
+    assert!(fx.code_lines()[0].starts_with("▸ 1–4"), "second click collapses");
+    // A click on a code line does not move the selection off the headers.
+    fx.app.on_mouse(click(2));
+    fx.draw();
+    assert_eq!(fx.app.code_panel.sel, 0);
+}
+
+#[test]
+fn full_drill_down_reaches_leaves_with_fake_backend() {
+    let mut fx = fixture(100, 40);
+    let long: String = (1..=40)
+        .map(|i| {
+            if i % 6 == 0 {
+                "
+"
+                .to_string()
+            } else {
+                format!(
+                    "let v{i} = {i};
+"
+                )
+            }
+        })
+        .collect();
+    write(fx.dir.path(), "src/main.rs", &long);
+    fx.open_main();
+    for _ in 0..50 {
+        fx.draw();
+        let next = fx.app.code_rows.iter().position(|r| {
+            let t: String = r.line.spans.iter().map(|s| s.content.as_ref()).collect();
+            t.trim_start().starts_with('▸')
+        });
+        let Some(i) = next else { break };
+        fx.app.click(i);
+        fx.wait_jobs();
+    }
+    fx.draw();
+    let headers: Vec<String> = fx
+        .app
+        .code_rows
+        .iter()
+        .filter(|r| r.kind == super::rows::RowKind::BlockHeader)
+        .map(|r| r.line.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+        .collect();
+    assert!(headers.iter().all(|h| !h.trim_start().starts_with('▸')), "{headers:#?}");
+    assert!(headers.iter().any(|h| h.trim_start().starts_with('·')));
+    assert_eq!(fx.app.errors, 0, "{:?}", fx.app.last_error);
 }
 
 #[test]
@@ -268,7 +458,7 @@ fn large_repository_stays_fast() {
     let started = std::time::Instant::now();
     let (tree, _) = Tree::list(root).unwrap();
     println!("list 5000 files: {:?}", started.elapsed());
-    let mut app = App::for_tests(ctx, tree);
+    let mut app = App::with_tree(ctx, tree).unwrap();
     for i in 0..app.tree.nodes.len() {
         if app.tree.node(i).is_dir {
             let p = app.tree.node(i).path.clone();

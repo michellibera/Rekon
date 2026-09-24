@@ -5,6 +5,7 @@ use std::collections::HashSet;
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use rekon_core::model::Block;
 use rekon_core::scan::{ROOT, Tree};
 use rekon_core::text;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -22,7 +23,6 @@ pub enum Desc {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)] // block rows arrive with the code panel blocks
 pub enum RowKind {
     Dir,
     File,
@@ -32,7 +32,6 @@ pub enum RowKind {
 
 /// What a row points at.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-#[allow(dead_code)] // block rows arrive with the code panel blocks
 pub enum RowRef {
     /// Tree node by path.
     Node(String),
@@ -43,7 +42,6 @@ pub enum RowRef {
 }
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)] // depth is read by the code panel blocks
 pub struct Row {
     pub depth: usize,
     pub kind: RowKind,
@@ -155,6 +153,95 @@ pub fn code_row(nr: u32, depth: usize, prefix: Vec<Span<'static>>, code: Option<
     }
 }
 
+/// Colors of the bar in front of code lines, one per block level, cyclic.
+const LEVEL_COLORS: [Color; 6] = [
+    Color::Cyan,
+    Color::Magenta,
+    Color::Yellow,
+    Color::Green,
+    Color::Blue,
+    Color::Red,
+];
+
+pub fn level_color(depth: usize) -> Color {
+    LEVEL_COLORS[depth % LEVEL_COLORS.len()]
+}
+
+/// Inputs of the code panel with blocks.
+pub struct BlockView<'a> {
+    pub blocks: &'a [Block],
+    pub expanded: &'a dyn Fn((u32, u32)) -> bool,
+    /// A split of this block is running.
+    pub pending: &'a dyn Fn((u32, u32)) -> bool,
+    /// Headers only (`o`).
+    pub desc_only: bool,
+    pub lines: &'a [String],
+    pub highlighted: Option<&'a [Line<'static>]>,
+    pub width: usize,
+}
+
+/// Header per visible block (`{indent}{marker} {start}–{end}  {summary}`); under a
+/// collapsed block or a leaf its code lines (`{indent}│ {nr:>4} {code}`); an expanded
+/// block shows its children one level deeper instead of its code.
+pub fn block_rows(view: &BlockView) -> Vec<Row> {
+    let mut out = Vec::new();
+    push_blocks(view, view.blocks, 0, &mut out);
+    out
+}
+
+fn push_blocks(view: &BlockView, blocks: &[Block], depth: usize, out: &mut Vec<Row>) {
+    for b in blocks {
+        let has_children = matches!(&b.children, Some(c) if !c.is_empty());
+        let expanded = (view.expanded)(b.lines);
+        let pending = (view.pending)(b.lines);
+        let marker = if pending {
+            "⏳"
+        } else if b.is_leaf() {
+            "·"
+        } else if expanded && has_children {
+            "▾"
+        } else {
+            "▸"
+        };
+        let indent = "  ".repeat(depth);
+        let range = format!("{}–{}", b.lines.0, b.lines.1);
+        let used = indent.width() + marker.width() + 1 + range.width() + 2;
+        let summary = fit(&b.summary, view.width.saturating_sub(used));
+        out.push(Row {
+            depth,
+            kind: RowKind::BlockHeader,
+            target: RowRef::Block(b.lines),
+            line: Line::from(vec![
+                Span::raw(indent.clone()),
+                Span::styled(marker.to_string(), Style::new().fg(level_color(depth))),
+                Span::raw(" "),
+                Span::styled(range, DIM),
+                Span::raw("  "),
+                Span::styled(summary, Style::new().add_modifier(Modifier::BOLD)),
+            ]),
+        });
+        if expanded && has_children {
+            push_blocks(view, b.children.as_deref().unwrap_or_default(), depth + 1, out);
+        } else if !view.desc_only {
+            for nr in b.lines.0..=b.lines.1 {
+                let i = nr as usize - 1;
+                let prefix = vec![
+                    Span::raw(indent.clone()),
+                    Span::styled("│ ", Style::new().fg(level_color(depth))),
+                ];
+                let raw = view.lines.get(i).map_or("", String::as_str);
+                out.push(code_row(
+                    nr,
+                    depth,
+                    prefix,
+                    view.highlighted.and_then(|h| h.get(i)),
+                    raw,
+                ));
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,5 +280,77 @@ mod tests {
         assert_eq!(fit("abcdef", 4), "abc…");
         assert_eq!(fit("zażółć", 3), "za…");
         assert_eq!(fit("abc", 0), "");
+    }
+
+    fn text(row: &Row) -> String {
+        row.line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    fn nested() -> Vec<Block> {
+        let mut b = Block::new(3, 6, "Second");
+        b.children = Some(vec![Block::new(3, 4, "Inner a"), Block::new(5, 6, "Inner b")]);
+        b.children.as_mut().unwrap()[1].children = Some(Vec::new());
+        vec![Block::new(1, 2, "First"), b]
+    }
+
+    fn render(expanded: &[(u32, u32)], pending: &[(u32, u32)], desc_only: bool) -> Vec<String> {
+        let lines: Vec<String> = (1..=6).map(|i| format!("line{i}")).collect();
+        let blocks = nested();
+        let exp = |r: (u32, u32)| expanded.contains(&r);
+        let pen = |r: (u32, u32)| pending.contains(&r);
+        let view = BlockView {
+            blocks: &blocks,
+            expanded: &exp,
+            pending: &pen,
+            desc_only,
+            lines: &lines,
+            highlighted: None,
+            width: 40,
+        };
+        block_rows(&view).iter().map(text).collect()
+    }
+
+    #[test]
+    fn collapsed_blocks_show_their_code() {
+        assert_eq!(
+            render(&[], &[], false),
+            [
+                "▸ 1–2  First",
+                "│    1 line1",
+                "│    2 line2",
+                "▸ 3–6  Second",
+                "│    3 line3",
+                "│    4 line4",
+                "│    5 line5",
+                "│    6 line6",
+            ]
+        );
+    }
+
+    #[test]
+    fn expanded_block_shows_children_one_level_deeper() {
+        assert_eq!(
+            render(&[(3, 6)], &[], false),
+            [
+                "▸ 1–2  First",
+                "│    1 line1",
+                "│    2 line2",
+                "▾ 3–6  Second",
+                "  ▸ 3–4  Inner a",
+                "  │    3 line3",
+                "  │    4 line4",
+                "  · 5–6  Inner b",
+                "  │    5 line5",
+                "  │    6 line6",
+            ]
+        );
+    }
+
+    #[test]
+    fn descriptions_only_and_pending_marker() {
+        assert_eq!(
+            render(&[(3, 6)], &[(3, 4)], true),
+            ["▸ 1–2  First", "▾ 3–6  Second", "  ⏳ 3–4  Inner a", "  · 5–6  Inner b"]
+        );
     }
 }

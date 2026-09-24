@@ -1,5 +1,5 @@
-//! TUI state and event handling. Background threads (scan, init, highlighting)
-//! report through one channel; the UI thread owns all state.
+//! TUI state and event handling. Background threads (scan, init, highlighting) and
+//! the job pool (model calls) report through channels; the UI thread owns all state.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -12,11 +12,13 @@ use ratatui::layout::Rect;
 use ratatui::text::Line;
 use rekon_core::Ctx;
 use rekon_core::init::{self, Options, Progress};
-use rekon_core::model::{DirNote, FileNote, Freshness, ProjectNote, freshness};
+use rekon_core::jobs::{JobDone, JobKey, JobPool};
+use rekon_core::model::{Blocks, DirNote, FileNote, Freshness, ProjectNote, freshness};
 use rekon_core::scan::{Excluder, Tree};
+use rekon_core::{segment, text};
 
 use super::highlight::{self, Lines};
-use super::rows::{self, Desc, Row, RowKind, RowRef};
+use super::rows::{self, BlockView, Desc, Row, RowKind, RowRef};
 
 const TICK: Duration = Duration::from_secs(2);
 const RESCAN: Duration = Duration::from_secs(15);
@@ -176,6 +178,14 @@ impl Notes {
         changed
     }
 
+    pub fn forget_file(&mut self, path: &str) {
+        self.files.remove(path);
+    }
+
+    pub fn forget_dir(&mut self, path: &str) {
+        self.dirs.remove(path);
+    }
+
     pub fn clear(&mut self) {
         *self = Notes::default();
     }
@@ -186,8 +196,12 @@ pub struct App {
     pub tree: Tree,
     pub notes: Notes,
     pub expanded: HashSet<String>,
+    /// Expanded blocks as (file path, line range).
+    pub expanded_blocks: HashSet<(String, (u32, u32))>,
     pub focus: Focus,
     pub wide: bool,
+    /// Descriptions only in the code panel (`o`).
+    pub desc_only: bool,
     pub popup: Option<Popup>,
     pub open: Option<OpenFile>,
     pub tree_rows: Vec<Row>,
@@ -199,6 +213,8 @@ pub struct App {
     pub init: Option<Progress>,
     pub errors: usize,
     pub last_error: Option<String>,
+    pub pool: JobPool,
+    done_rx: Receiver<JobDone>,
     hl_cache: highlight::Cache,
     bg_tx: Sender<Bg>,
     bg_rx: Receiver<Bg>,
@@ -214,42 +230,7 @@ impl App {
     /// Lists the repository (fast) and starts hashing and, without a map, init in the background.
     pub fn new(ctx: Arc<Ctx>) -> anyhow::Result<Self> {
         let (tree, _) = Tree::list(&ctx.root)?;
-        let (bg_tx, bg_rx) = channel();
-        let excluder = Excluder::new(&ctx.config.exclude)?;
-        let mut app = Self {
-            ctx,
-            tree,
-            notes: Notes::default(),
-            expanded: HashSet::new(),
-            focus: Focus::Tree,
-            wide: false,
-            popup: None,
-            open: None,
-            tree_rows: Vec::new(),
-            code_rows: Vec::new(),
-            tree_panel: Panel {
-                follow: true,
-                ..Default::default()
-            },
-            code_panel: Panel {
-                follow: true,
-                ..Default::default()
-            },
-            tree_sel_key: None,
-            code_sel_key: None,
-            init: None,
-            errors: 0,
-            last_error: None,
-            hl_cache: highlight::Cache::default(),
-            bg_tx,
-            bg_rx,
-            excluder,
-            last_tick: Instant::now(),
-            last_rescan: Instant::now(),
-            rescanning: false,
-            quit: false,
-            dirty: true,
-        };
+        let mut app = Self::with_tree(ctx, tree)?;
         app.start_rescan();
         if init::needs_init(&app.ctx) {
             app.start_init();
@@ -257,18 +238,21 @@ impl App {
         Ok(app)
     }
 
-    /// Test constructor: a given tree, nothing in the background.
-    #[cfg(test)]
-    pub fn for_tests(ctx: Arc<Ctx>, tree: Tree) -> Self {
+    /// State for a given tree, nothing started in the background (also for tests).
+    pub fn with_tree(ctx: Arc<Ctx>, tree: Tree) -> anyhow::Result<Self> {
         let (bg_tx, bg_rx) = channel();
-        let excluder = Excluder::new(&ctx.config.exclude).unwrap();
-        Self {
+        let (done_tx, done_rx) = channel();
+        let excluder = Excluder::new(&ctx.config.exclude)?;
+        let pool = JobPool::new(ctx.config.workers, done_tx);
+        Ok(Self {
             ctx,
             tree,
             notes: Notes::default(),
             expanded: HashSet::new(),
+            expanded_blocks: HashSet::new(),
             focus: Focus::Tree,
             wide: false,
+            desc_only: false,
             popup: None,
             open: None,
             tree_rows: Vec::new(),
@@ -286,6 +270,8 @@ impl App {
             init: None,
             errors: 0,
             last_error: None,
+            pool,
+            done_rx,
             hl_cache: highlight::Cache::default(),
             bg_tx,
             bg_rx,
@@ -295,7 +281,7 @@ impl App {
             rescanning: false,
             quit: false,
             dirty: true,
-        }
+        })
     }
 
     pub fn repo_name(&self) -> String {
@@ -356,7 +342,7 @@ impl App {
         self.dirty = true;
     }
 
-    /// Handles background messages and periodic refresh. Call often.
+    /// Handles background messages, finished jobs and periodic refresh. Call often.
     pub fn poll(&mut self) {
         while let Ok(msg) = self.bg_rx.try_recv() {
             self.dirty = true;
@@ -391,6 +377,17 @@ impl App {
                         open.highlighted = lines;
                     }
                 }
+            }
+        }
+        while let Ok(done) = self.done_rx.try_recv() {
+            self.dirty = true;
+            match &done.key {
+                JobKey::FileSummary(p) | JobKey::Level1(p) | JobKey::Split(p, _) => self.notes.forget_file(p),
+                JobKey::DirSummary(p) => self.notes.forget_dir(p),
+                JobKey::Init => self.notes.clear(),
+            }
+            if let Err(e) = done.result {
+                self.error(e);
             }
         }
         if self.last_tick.elapsed() >= TICK {
@@ -458,25 +455,26 @@ impl App {
     pub fn desc(&mut self, i: usize) -> Desc {
         let node = self.tree.node(i);
         let path = node.path.clone();
-        let init_running = self.init.is_some();
         if node.is_dir {
             let key = self.tree.dir_key(i);
+            let pending = self.init.is_some() || self.pool.is_pending(&JobKey::DirSummary(path.clone()));
             let summary = self.notes.dir(&self.ctx, &path).summary.clone();
             return to_desc(
                 summary.as_ref().map(|s| s.text.clone()),
                 freshness(summary.as_ref(), Some(&key)),
-                init_running,
+                pending,
             );
         }
         let info = node.file.clone().unwrap_or_default();
         if let Some(label) = info.label() {
             return Desc::Static(label);
         }
+        let pending = self.init.is_some() || self.pool.is_pending(&JobKey::FileSummary(path.clone()));
         let summary = self.notes.file(&self.ctx, &path).summary.clone();
         to_desc(
             summary.as_ref().map(|s| s.text.clone()),
             freshness(summary.as_ref(), info.hash.as_deref()),
-            init_running,
+            pending,
         )
     }
 
@@ -486,6 +484,38 @@ impl App {
 
     pub fn project_overview(&mut self) -> Option<String> {
         self.notes.project(&self.ctx).overview.clone()
+    }
+
+    /// Fresh blocks of the open file.
+    pub fn open_blocks(&mut self) -> Option<Blocks> {
+        let open = self.open.as_ref()?;
+        let (path, hash) = (open.path.clone(), open.hash.clone()?);
+        self.notes
+            .file(&self.ctx, &path)
+            .blocks
+            .clone()
+            .filter(|b| b.hash == hash)
+    }
+
+    /// Why the open file has no blocks (for the panel title), if it has none.
+    pub fn blocks_status(&mut self) -> Option<String> {
+        let open = self.open.as_ref()?;
+        if open.problem.is_some() {
+            return None;
+        }
+        let path = open.path.clone();
+        let lines = open.lines.len() as u32;
+        if self.pool.is_pending(&JobKey::Level1(path.clone())) {
+            return Some(text::SPLITTING.to_string());
+        }
+        if lines > self.ctx.config.max_segment_lines {
+            return Some(text::too_long_for_blocks(lines, self.ctx.config.max_segment_lines));
+        }
+        if self.open_blocks().is_none() {
+            let stale = self.notes.file(&self.ctx, &path).blocks.is_some();
+            return Some(if stale { text::BLOCKS_OUTDATED } else { text::NO_BLOCKS }.to_string());
+        }
+        None
     }
 
     // ----- rows -----
@@ -502,17 +532,43 @@ impl App {
         self.tree_rows = out;
         self.tree_panel.sel = restore(&self.tree_rows, &self.tree_sel_key, self.tree_panel.sel);
         self.code_rows = self.build_code_rows(code_width);
-        self.code_panel.sel = restore(&self.code_rows, &self.code_sel_key, self.code_panel.sel);
+        let mut sel = restore(&self.code_rows, &self.code_sel_key, self.code_panel.sel);
+        if self.has_headers() && self.code_rows.get(sel).is_some_and(|r| r.kind != RowKind::BlockHeader) {
+            // With blocks the selection stays on headers: the one above, else the first.
+            sel = (0..=sel)
+                .rev()
+                .find(|&i| self.code_rows[i].kind == RowKind::BlockHeader)
+                .or_else(|| self.code_rows.iter().position(|r| r.kind == RowKind::BlockHeader))
+                .unwrap_or(0);
+        }
+        self.code_panel.sel = sel;
     }
 
-    fn build_code_rows(&self, _width: usize) -> Vec<Row> {
+    fn build_code_rows(&mut self, width: usize) -> Vec<Row> {
+        let blocks = self.open_blocks();
         let Some(open) = &self.open else { return Vec::new() };
-        let hl = open.highlighted.as_ref();
-        open.lines
-            .iter()
-            .enumerate()
-            .map(|(i, raw)| rows::code_row(i as u32 + 1, 0, Vec::new(), hl.and_then(|h| h.get(i)), raw))
-            .collect()
+        let hl = open.highlighted.as_ref().map(|h| h.as_slice());
+        let Some(blocks) = blocks.filter(|b| !b.items.is_empty()) else {
+            return open
+                .lines
+                .iter()
+                .enumerate()
+                .map(|(i, raw)| rows::code_row(i as u32 + 1, 0, Vec::new(), hl.and_then(|h| h.get(i)), raw))
+                .collect();
+        };
+        let path = open.path.clone();
+        let expanded = |r: (u32, u32)| self.expanded_blocks.contains(&(path.clone(), r));
+        let pending = |r: (u32, u32)| self.pool.is_pending(&JobKey::Split(path.clone(), r));
+        let view = BlockView {
+            blocks: &blocks.items,
+            expanded: &expanded,
+            pending: &pending,
+            desc_only: self.desc_only,
+            lines: &open.lines,
+            highlighted: hl,
+            width,
+        };
+        rows::block_rows(&view)
     }
 
     pub fn selected_tree_path(&self) -> Option<&str> {
@@ -520,6 +576,17 @@ impl App {
             RowRef::Node(p) => Some(p),
             _ => None,
         }
+    }
+
+    fn selected_block(&self) -> Option<(u32, u32)> {
+        match self.code_rows.get(self.code_panel.sel)?.target {
+            RowRef::Block(r) => Some(r),
+            _ => None,
+        }
+    }
+
+    fn has_headers(&self) -> bool {
+        self.code_rows.iter().any(|r| r.kind == RowKind::BlockHeader)
     }
 
     // ----- input -----
@@ -556,6 +623,8 @@ impl App {
                     self.focus = Focus::Tree;
                 }
             }
+            KeyCode::Char('o') => self.desc_only = !self.desc_only,
+            KeyCode::Char('r') => self.regenerate(),
             KeyCode::Tab | KeyCode::BackTab => {
                 self.focus = match self.focus {
                     Focus::Tree if !self.wide => Focus::Code,
@@ -575,7 +644,9 @@ impl App {
         }
     }
 
+    /// Moves the selection; in the code panel with blocks it only stops on headers.
     fn move_sel(&mut self, delta: isize) {
+        let headers_only = self.focus == Focus::Code && self.has_headers();
         let (panel, rows, key) = match self.focus {
             Focus::Tree => (&mut self.tree_panel, &self.tree_rows, &mut self.tree_sel_key),
             Focus::Code => (&mut self.code_panel, &self.code_rows, &mut self.code_sel_key),
@@ -583,7 +654,23 @@ impl App {
         if rows.is_empty() {
             return;
         }
-        let target = (panel.sel as isize + delta).clamp(0, rows.len() as isize - 1) as usize;
+        let mut target = (panel.sel as isize + delta).clamp(0, rows.len() as isize - 1) as usize;
+        if headers_only {
+            let is_header = |i: usize| rows[i].kind == RowKind::BlockHeader;
+            let forward = (target..rows.len()).find(|&i| is_header(i));
+            let backward = (0..=target).rev().find(|&i| is_header(i));
+            let pick = if delta > 0 {
+                forward.or(backward)
+            } else {
+                backward.or(forward)
+            };
+            // A single step must leave the current header.
+            target = match pick {
+                Some(i) if i == panel.sel && delta == 1 => (i + 1..rows.len()).find(|&j| is_header(j)).unwrap_or(i),
+                Some(i) => i,
+                None => panel.sel,
+            };
+        }
         panel.sel = target;
         panel.follow = true;
         *key = Some(rows[target].target.clone());
@@ -591,6 +678,9 @@ impl App {
 
     fn activate(&mut self, focus_code: bool) {
         if self.focus == Focus::Code {
+            if let Some(range) = self.selected_block() {
+                self.expand_block(range, true);
+            }
             return;
         }
         let Some(row) = self.tree_rows.get(self.tree_panel.sel).cloned() else {
@@ -615,7 +705,7 @@ impl App {
 
     fn back(&mut self) {
         if self.focus == Focus::Code {
-            self.focus = Focus::Tree;
+            self.back_in_code();
             return;
         }
         let Some(row) = self.tree_rows.get(self.tree_panel.sel).cloned() else {
@@ -627,6 +717,61 @@ impl App {
         }
         if let Some((parent, _)) = path.rsplit_once('/') {
             self.select_tree_path(parent);
+        }
+    }
+
+    /// Collapses the selected block, else selects its parent header, else goes to the tree.
+    fn back_in_code(&mut self) {
+        let Some(open) = &self.open else {
+            self.focus = Focus::Tree;
+            return;
+        };
+        let path = open.path.clone();
+        let sel = self.code_panel.sel;
+        let Some(range) = self.selected_block() else {
+            self.focus = Focus::Tree;
+            return;
+        };
+        if self.expanded_blocks.remove(&(path, range)) {
+            return;
+        }
+        let depth = self.code_rows[sel].depth;
+        let parent = (0..sel)
+            .rev()
+            .find(|&i| self.code_rows[i].kind == RowKind::BlockHeader && self.code_rows[i].depth < depth);
+        match parent {
+            Some(i) => {
+                self.code_panel.sel = i;
+                self.code_panel.follow = true;
+                self.code_sel_key = Some(self.code_rows[i].target.clone());
+            }
+            None => self.focus = Focus::Tree,
+        }
+    }
+
+    /// Expands a block: children from the note, or a split job when there are none.
+    /// On an expanded block a key moves to its first child, a click collapses it.
+    fn expand_block(&mut self, range: (u32, u32), from_key: bool) {
+        let Some(path) = self.open.as_ref().map(|o| o.path.clone()) else {
+            return;
+        };
+        let Some(blocks) = self.open_blocks() else { return };
+        let Some(block) = blocks.find(range) else { return };
+        if block.is_leaf() {
+            return;
+        }
+        let key = (path.clone(), range);
+        if self.expanded_blocks.contains(&key) {
+            if from_key {
+                self.move_sel(1);
+            } else {
+                self.expanded_blocks.remove(&key);
+            }
+            return;
+        }
+        self.expanded_blocks.insert(key);
+        if block.children.is_none() {
+            self.submit_split(&path, range, false);
         }
     }
 
@@ -700,10 +845,63 @@ impl App {
                 }
             }
             Focus::Code => {
-                let Some(row) = self.code_rows.get(index) else { return };
-                self.code_panel.sel = index;
-                self.code_sel_key = Some(row.target.clone());
+                let Some(row) = self.code_rows.get(index).cloned() else {
+                    return;
+                };
+                if let RowRef::Block(range) = row.target {
+                    self.code_panel.sel = index;
+                    self.code_sel_key = Some(row.target.clone());
+                    self.expand_block(range, false);
+                } else if !self.has_headers() {
+                    self.code_panel.sel = index;
+                    self.code_sel_key = Some(row.target.clone());
+                }
             }
+        }
+    }
+
+    // ----- jobs -----
+
+    /// Queues level-1 blocks of a file (ignored while the same job is pending).
+    fn submit_level1(&mut self, path: &str, force: bool) {
+        let ctx = Arc::clone(&self.ctx);
+        let p = path.to_string();
+        self.pool.submit(JobKey::Level1(p.clone()), move || {
+            segment::level1(&ctx, &p, force).map(|_| ())
+        });
+    }
+
+    fn submit_split(&mut self, path: &str, range: (u32, u32), force: bool) {
+        let ctx = Arc::clone(&self.ctx);
+        let p = path.to_string();
+        self.pool.submit(JobKey::Split(p.clone(), range), move || {
+            segment::split_block(&ctx, &p, range, force).map(|_| ())
+        });
+    }
+
+    /// `r`: regenerates the selected block's split (code panel) or the file's blocks.
+    fn regenerate(&mut self) {
+        if self.focus != Focus::Code {
+            return;
+        }
+        let Some(open) = &self.open else { return };
+        if open.problem.is_some() {
+            return;
+        }
+        let path = open.path.clone();
+        match self.selected_block() {
+            Some(range)
+                if self
+                    .open_blocks()
+                    .and_then(|b| b.find(range).map(|b| b.line_count()))
+                    .unwrap_or(0)
+                    > 1 =>
+            {
+                self.expanded_blocks.insert((path.clone(), range));
+                self.submit_split(&path, range, true);
+            }
+            Some(_) => {}
+            None => self.submit_level1(&path, true),
         }
     }
 
@@ -717,6 +915,13 @@ impl App {
         };
         self.code_sel_key = None;
         self.reload_open(path);
+        // Blocks are split when missing or outdated, right on opening.
+        let fits = self.open.as_ref().is_some_and(|o| {
+            o.problem.is_none() && !o.lines.is_empty() && o.lines.len() as u32 <= self.ctx.config.max_segment_lines
+        });
+        if fits && self.open_blocks().is_none() && self.excluder.matched(path).is_none() {
+            self.submit_level1(path, false);
+        }
     }
 
     /// Reads the file into the code panel (again), keeping the scroll position.
@@ -735,22 +940,22 @@ impl App {
             highlighted: None,
         };
         if size > MAX_SHOWN_BYTES {
-            open.problem = Some(rekon_core::text::too_large(size));
+            open.problem = Some(text::too_large(size));
         } else {
             match std::fs::read(&abs) {
                 Ok(bytes) if bytes[..bytes.len().min(8000)].contains(&0) => {
-                    open.problem = Some(rekon_core::text::binary(size));
+                    open.problem = Some(text::binary(size));
                 }
                 Ok(bytes) => {
                     let hash = rekon_core::hash::hash_bytes(&bytes);
-                    let text = String::from_utf8_lossy(&bytes).into_owned();
-                    open.lines = text.lines().map(str::to_string).collect();
+                    let content = String::from_utf8_lossy(&bytes).into_owned();
+                    open.lines = content.lines().map(str::to_string).collect();
                     open.highlighted = self.hl_cache.get(path, &hash);
                     if open.highlighted.is_none() {
                         let tx = self.bg_tx.clone();
                         let (p, h) = (path.to_string(), hash.clone());
                         std::thread::spawn(move || {
-                            let lines = highlight::highlight(&p, &text);
+                            let lines = highlight::highlight(&p, &content);
                             let _ = tx.send(Bg::Highlighted {
                                 path: p,
                                 hash: h,
@@ -763,6 +968,7 @@ impl App {
                 Err(e) => open.problem = Some(e.to_string()),
             }
         }
+        self.notes.forget_file(path);
         self.open = Some(open);
         self.dirty = true;
     }
@@ -773,16 +979,18 @@ impl App {
             && let Some(open) = &self.open
         {
             let path = open.path.clone();
+            if let Some(range) = self.selected_block()
+                && let Some(b) = self.open_blocks().and_then(|b| b.find(range).cloned())
+            {
+                return format!("{path}:{}–{} — {}", range.0, range.1, b.summary);
+            }
             let summary = self
                 .notes
                 .file(&self.ctx, &path)
                 .summary
                 .as_ref()
                 .map(|s| s.text.clone());
-            return format!(
-                "{path} — {}",
-                summary.unwrap_or_else(|| rekon_core::text::NO_DESCRIPTION.into())
-            );
+            return format!("{path} — {}", summary.unwrap_or_else(|| text::NO_DESCRIPTION.into()));
         }
         let Some(path) = self.selected_tree_path().map(str::to_string) else {
             return String::new();
@@ -790,30 +998,30 @@ impl App {
         let Some(i) = self.tree.get(&path) else {
             return String::new();
         };
-        let text = match self.desc(i) {
+        let desc = match self.desc(i) {
             Desc::Fresh(t) | Desc::Static(t) => t,
             Desc::Stale(t) => format!("⚠ {t}"),
-            Desc::Missing => rekon_core::text::NO_DESCRIPTION.into(),
-            Desc::Pending => rekon_core::text::PENDING.into(),
+            Desc::Missing => text::NO_DESCRIPTION.into(),
+            Desc::Pending => text::PENDING.into(),
         };
         let shown = if self.tree.node(i).is_dir {
             format!("{path}/")
         } else {
             path
         };
-        format!("{shown} — {text}")
+        format!("{shown} — {desc}")
     }
 
     pub fn jobs_running(&self) -> usize {
-        usize::from(self.init.is_some())
+        self.pool.pending_count() + usize::from(self.init.is_some())
     }
 }
 
-fn to_desc(text: Option<String>, f: Freshness, init_running: bool) -> Desc {
+fn to_desc(text: Option<String>, f: Freshness, pending: bool) -> Desc {
     match (f, text) {
         (Freshness::Fresh, Some(t)) => Desc::Fresh(t),
         (Freshness::Stale, Some(t)) => Desc::Stale(t),
-        _ if init_running => Desc::Pending,
+        _ if pending => Desc::Pending,
         _ => Desc::Missing,
     }
 }
