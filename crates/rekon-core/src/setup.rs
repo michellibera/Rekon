@@ -9,6 +9,9 @@ use serde_json::{Value, json};
 use crate::store::write_atomic;
 
 const SKILL: &str = include_str!("../prompts/skill.md");
+const OPENCODE_RULE: &str = include_str!("../prompts/opencode-rule.md");
+const RULE_BEGIN: &str = "<!-- rekon:begin -->";
+const RULE_END: &str = "<!-- rekon:end -->";
 
 /// Hook events and the subcommand each one runs.
 const HOOKS: [(&str, &str); 2] = [("Stop", "check --hook"), ("SessionStart", "context --hook")];
@@ -132,6 +135,60 @@ pub fn setup(claude_dir: &Path, exe: &str, dry_run: bool) -> Result<Vec<String>>
     Ok(changes)
 }
 
+/// OpenCode config folder: `$XDG_CONFIG_HOME/opencode`, else `~/.config/opencode`.
+pub fn opencode_dir() -> Result<PathBuf> {
+    if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME").filter(|d| !d.is_empty()) {
+        return Ok(PathBuf::from(dir).join("opencode"));
+    }
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .context("cannot find the home folder (HOME)")?;
+    Ok(PathBuf::from(home).join(".config").join("opencode"))
+}
+
+/// `text` with the rekon rule block added, or replaced when present.
+pub fn with_opencode_rule(text: &str, exe: &str) -> String {
+    let block = format!(
+        "{RULE_BEGIN}\n{}{RULE_END}\n",
+        OPENCODE_RULE.replace("{rekon}", &quoted(exe))
+    );
+    if let (Some(start), Some(end)) = (text.find(RULE_BEGIN), text.find(RULE_END))
+        && start < end
+    {
+        let after = &text[end + RULE_END.len()..];
+        return format!("{}{block}{}", &text[..start], after.strip_prefix('\n').unwrap_or(after));
+    }
+    let mut out = text.to_string();
+    if !out.is_empty() && !out.ends_with("\n\n") {
+        out.push_str(if out.ends_with('\n') { "\n" } else { "\n\n" });
+    }
+    out.push_str(&block);
+    out
+}
+
+/// Adds the rekon rule to OpenCode's global `AGENTS.md` (OpenCode has no Stop hook
+/// that could ask the agent for updates, so a rule asks it instead).
+pub fn setup_opencode(opencode_dir: &Path, claude_dir: &Path, exe: &str, dry_run: bool) -> Result<Vec<String>> {
+    let path = opencode_dir.join("AGENTS.md");
+    let current = std::fs::read_to_string(&path).ok();
+    let updated = with_opencode_rule(current.as_deref().unwrap_or(""), exe);
+    if current.as_deref() == Some(updated.as_str()) {
+        return Ok(Vec::new());
+    }
+    let mut changes = vec![format!("write the rekon rule to {}", path.display())];
+    if current.is_none() && claude_dir.join("CLAUDE.md").exists() {
+        changes.push(format!(
+            "note: with {} present, OpenCode no longer falls back to {}",
+            path.display(),
+            claude_dir.join("CLAUDE.md").display()
+        ));
+    }
+    if !dry_run {
+        write_atomic(&path, updated.as_bytes())?;
+    }
+    Ok(changes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,5 +273,29 @@ mod tests {
             std::fs::read_to_string(dir.path().join("settings.json")).unwrap(),
             "{ not json"
         );
+    }
+
+    #[test]
+    fn opencode_rule_is_added_once_and_replaced_in_place() {
+        let once = with_opencode_rule("# Mine\n", EXE);
+        assert!(once.starts_with("# Mine\n\n<!-- rekon:begin -->"));
+        assert!(once.contains("/usr/local/bin/rekon apply"));
+        assert_eq!(with_opencode_rule(&once, EXE), once);
+        let moved = with_opencode_rule(&(once.clone() + "\n# After\n"), "/opt/rekon");
+        assert!(moved.contains("/opt/rekon apply") && !moved.contains("/usr/local/bin/rekon"));
+        assert!(moved.ends_with("# After\n"));
+        assert_eq!(moved.matches("rekon:begin").count(), 1);
+    }
+
+    #[test]
+    fn opencode_setup_warns_about_claude_fallback() {
+        let oc = tempfile::tempdir().unwrap();
+        let claude = tempfile::tempdir().unwrap();
+        std::fs::write(claude.path().join("CLAUDE.md"), "x").unwrap();
+        let planned = setup_opencode(oc.path(), claude.path(), EXE, true).unwrap();
+        assert_eq!(planned.len(), 2);
+        assert!(!oc.path().join("AGENTS.md").exists());
+        setup_opencode(oc.path(), claude.path(), EXE, false).unwrap();
+        assert!(setup_opencode(oc.path(), claude.path(), EXE, false).unwrap().is_empty());
     }
 }

@@ -8,6 +8,7 @@ use crate::config::Config;
 
 pub mod claude;
 pub mod fake;
+pub mod opencode;
 
 /// Kind of task; used for logging and by the fake backend.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -61,6 +62,7 @@ pub fn from_config(config: &Config) -> Result<Arc<dyn Backend>> {
     Ok(match config.backend.as_str() {
         "claude" => Arc::new(claude::ClaudeBackend::new(config)?),
         "fake" => Arc::new(fake::FakeBackend::from_env()),
-        other => bail!("unknown backend \"{other}\" (expected claude or fake)"),
+        "opencode" => Arc::new(opencode::OpenCodeBackend::new(config)?),
+        other => bail!("unknown backend \"{other}\" (expected claude, opencode or fake)"),
     })
 }

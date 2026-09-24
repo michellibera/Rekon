@@ -84,6 +84,9 @@ enum Cmd {
         /// Only show the changes
         #[arg(long)]
         dry_run: bool,
+        /// Instead: add the rekon rule to OpenCode's global AGENTS.md
+        #[arg(long)]
+        opencode: bool,
     },
 }
 
@@ -239,14 +242,19 @@ fn run(cli: Cli) -> Result<u8> {
             print!("{}", context::render(&ctx, &setup::exe_path()?)?);
             Ok(0)
         }
-        Cmd::Setup { dry_run } => {
+        Cmd::Setup { dry_run, opencode } => {
             let dir = setup::claude_dir()?;
-            let changes = setup::setup(&dir, &setup::exe_path()?, dry_run)?;
+            let changes = if opencode {
+                setup::setup_opencode(&setup::opencode_dir()?, &dir, &setup::exe_path()?, dry_run)?
+            } else {
+                setup::setup(&dir, &setup::exe_path()?, dry_run)?
+            };
             if changes.is_empty() {
                 eprintln!("Nothing to change in {}", dir.display());
             }
             for c in changes {
-                println!("{}{c}", if dry_run { "would " } else { "" });
+                let would = dry_run && !c.starts_with("note:");
+                println!("{}{c}", if would { "would " } else { "" });
             }
             Ok(0)
         }

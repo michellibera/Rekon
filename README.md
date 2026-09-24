@@ -76,6 +76,14 @@ rekon apply <<'EOF'
 EOF
 ```
 
+### With OpenCode
+
+`"backend": "opencode"` in `.rekon/config.json` (or `REKON_BACKEND=opencode`) calls
+`opencode run` instead of `claude -p`; `"opencode": {"model": "provider/model"}` picks the
+model, `"attach": "http://localhost:4096"` reuses a running `opencode serve`.
+`rekon setup --opencode` adds a rule to `~/.config/opencode/AGENTS.md` asking the agent to
+keep descriptions current.
+
 Run `setup` from the binary you will keep (e.g. after `cargo install --path crates/rekon`):
 hook commands store its full path.
 
