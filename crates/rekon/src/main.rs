@@ -1,13 +1,14 @@
 //! `rekon` binary: CLI subcommands; without a subcommand it opens the TUI.
 
-use std::io::{IsTerminal, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::process::ExitCode;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use rekon_core::init::{self, Options, Progress};
+use rekon_core::model::Author;
 use rekon_core::scan::{Tree, normalize_prefix};
-use rekon_core::{Ctx, segment, view};
+use rekon_core::{Ctx, apply, check, context, segment, setup, view};
 
 #[derive(Parser)]
 #[command(
@@ -60,6 +61,34 @@ enum Cmd {
         #[arg(long)]
         force: bool,
     },
+    /// Save descriptions from JSON on stdin: {"summaries": {"path": "text", "dir/": "text", ".": "text"}, "overview": "..."}
+    Apply {
+        /// Author recorded in the notes
+        #[arg(long, value_enum, default_value = "agent")]
+        by: By,
+    },
+    /// List changed files with outdated descriptions; with --hook acts as the Claude Code Stop hook
+    Check {
+        #[arg(long)]
+        hook: bool,
+    },
+    /// Print the overview and tree to depth 2; with --hook acts as the Claude Code SessionStart hook
+    Context {
+        #[arg(long)]
+        hook: bool,
+    },
+    /// Install the rekon-init skill and the hooks in ~/.claude (once per machine)
+    Setup {
+        /// Only show the changes
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum By {
+    Agent,
+    Auto,
 }
 
 /// Exit code for usage errors (bad arguments, missing map).
@@ -71,7 +100,7 @@ fn main() -> ExitCode {
         Ok(code) => ExitCode::from(code),
         Err(e) => {
             eprintln!("rekon: {e:#}");
-            ExitCode::from(1)
+            ExitCode::from(if e.downcast_ref::<Usage>().is_some() { USAGE } else { 1 })
         }
     }
 }
@@ -107,7 +136,7 @@ fn run(cli: Cli) -> Result<u8> {
             let (tree, _) = Tree::scan(&ctx.root, &ctx.config)?;
             let prefix = rel_prefix(&ctx, &cwd, prefix.as_deref());
             if tree.get(&prefix).is_none() {
-                bail!("{prefix} is not a file or folder of this repository");
+                return Err(Usage(format!("{prefix} is not a file or folder of this repository")).into());
             }
             if json {
                 println!(
@@ -152,13 +181,98 @@ fn run(cli: Cli) -> Result<u8> {
             }
             Ok(0)
         }
+        Cmd::Apply { by } => {
+            let ctx = open_with_map(&cwd)?;
+            let mut input = String::new();
+            std::io::stdin().read_to_string(&mut input)?;
+            let input = apply::parse(&input).map_err(|e| Usage(format!("{e:#}")))?;
+            let by = match by {
+                By::Agent => Author::Agent,
+                By::Auto => Author::Auto,
+            };
+            let report = apply::apply(&ctx, &input, by)?;
+            eprintln!("Saved: {}", report.written.len());
+            for w in &report.warnings {
+                eprintln!("warning: {w}");
+            }
+            for (path, e) in &report.errors {
+                eprintln!("error: {path}: {e}");
+            }
+            Ok(if report.errors.is_empty() { 0 } else { 1 })
+        }
+        Cmd::Check { hook: true } => {
+            // A hook must never break the session: errors are logged, not shown.
+            let mut input = String::new();
+            let _ = std::io::stdin().read_to_string(&mut input);
+            match check::stop_hook(&input, &setup::exe_path()?) {
+                Ok(Some(out)) => println!("{out}"),
+                Ok(None) => {}
+                Err(e) => log_hook_error(&cwd, "check", &e),
+            }
+            Ok(0)
+        }
+        Cmd::Check { hook: false } => {
+            let ctx = open_with_map(&cwd)?;
+            let stale = check::stale_changes(&ctx.root)?;
+            if stale.is_empty() {
+                eprintln!("All changed files have fresh descriptions.");
+            }
+            for p in stale {
+                println!("{p}");
+            }
+            Ok(0)
+        }
+        Cmd::Context { hook: true } => {
+            let mut input = String::new();
+            let _ = std::io::stdin().read_to_string(&mut input);
+            match context::session_start_hook(&input, &setup::exe_path()?) {
+                Ok(Some(out)) => print!("{out}"),
+                Ok(None) => {}
+                Err(e) => log_hook_error(&cwd, "context", &e),
+            }
+            Ok(0)
+        }
+        Cmd::Context { hook: false } => {
+            let ctx = open_with_map(&cwd)?;
+            print!("{}", context::render(&ctx, &setup::exe_path()?)?);
+            Ok(0)
+        }
+        Cmd::Setup { dry_run } => {
+            let dir = setup::claude_dir()?;
+            let changes = setup::setup(&dir, &setup::exe_path()?, dry_run)?;
+            if changes.is_empty() {
+                eprintln!("Nothing to change in {}", dir.display());
+            }
+            for c in changes {
+                println!("{}{c}", if dry_run { "would " } else { "" });
+            }
+            Ok(0)
+        }
+    }
+}
+
+/// Error that maps to exit code 2.
+#[derive(Debug)]
+struct Usage(String);
+
+impl std::fmt::Display for Usage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Usage {}
+
+fn log_hook_error(cwd: &std::path::Path, hook: &str, e: &anyhow::Error) {
+    if let Ok(root) = rekon_core::scan::find_root(cwd) {
+        rekon_core::store::Store::new(&root).log(&format!("{hook} hook error: {e:#}"));
     }
 }
 
 fn open_with_map(cwd: &std::path::Path) -> Result<Ctx> {
     let ctx = Ctx::open(cwd)?;
     if !ctx.store.exists() {
-        bail!(rekon_core::text::NO_MAP);
+        return Err(Usage(rekon_core::text::NO_MAP.into()).into());
     }
     Ok(ctx)
 }

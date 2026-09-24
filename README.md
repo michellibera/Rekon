@@ -31,6 +31,30 @@ rekon segment src/main.rs [--lines 15-40]
 
 `REKON_BACKEND=fake` answers deterministically without a model (tests, UI work).
 
+### With Claude Code
+
+```sh
+rekon setup --dry-run   # show what would change in ~/.claude
+rekon setup             # install the rekon-init skill and two hooks (once per machine)
+```
+
+- Stop hook (`rekon check --hook`): when files changed in the session have outdated
+  descriptions, the agent is asked to update them with one `rekon apply`.
+- SessionStart hook (`rekon context --hook`): the agent gets the overview and tree to depth 2.
+- `/rekon-init` in a session builds the map with the agent itself.
+
+`rekon apply` reads JSON on stdin; a key ending with `/` is a folder, `.` is the project:
+
+```sh
+rekon apply <<'EOF'
+{"summaries": {"src/auth.rs": "Verifies JWT tokens", "src/": "Application code", ".": "Shop backend"},
+ "overview": "Optional: 3-5 sentences."}
+EOF
+```
+
+Run `setup` from the binary you will keep (e.g. after `cargo install --path crates/rekon`):
+hook commands store its full path.
+
 ## Layout
 
 - `crates/rekon-core` — scanning, notes store, prompts, backends, init, segmentation (no UI).
