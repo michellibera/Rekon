@@ -18,6 +18,7 @@ clap.workspace = true
 ratatui.workspace = true
 syntect.workspace = true
 shell-words.workspace = true
+unicode-width.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

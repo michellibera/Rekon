@@ -52,6 +52,47 @@ pub fn stop_hook_reason(exe: &str, paths: &[String]) -> String {
     )
 }
 
+// TUI texts.
+
+pub const TREE_TITLE: &str = "Tree";
+pub const CODE_TITLE_EMPTY: &str = "Code";
+pub const OVERVIEW_TITLE: &str = "Project overview";
+pub const HELP_TITLE: &str = "Keys";
+pub const NO_OVERVIEW: &str = "No overview yet. Run `rekon init` (or wait for the background init).";
+pub const SELECT_FILE: &str = "Select a file in the tree to see its code.";
+pub const SPLITTING: &str = "splitting into blocks…";
+pub const HELP_HINT: &str = "? help";
+pub const NOT_TEXT: &str = "not a text file";
+
+pub fn too_long_for_blocks(lines: u32, max: u32) -> String {
+    format!("{lines} lines, more than max_segment_lines ({max}): no blocks")
+}
+
+pub fn status_line(jobs: usize, errors: usize, last_error: Option<&str>, cost: f64) -> String {
+    let errors = match last_error {
+        Some(e) if errors > 0 => format!("errors: {errors} ({e})"),
+        _ => format!("errors: {errors}"),
+    };
+    format!("jobs: {jobs} · {errors} · session cost ~${cost:.2} · {HELP_HINT}")
+}
+
+pub const HELP: &[(&str, &str)] = &[
+    ("↑/↓, k/j", "previous/next item (in the code panel: block header)"),
+    ("→/l, Enter", "expand folder, open file, expand block"),
+    ("←/h", "collapse or go to parent"),
+    ("Tab", "switch panel"),
+    ("PgUp/PgDn", "scroll by a page"),
+    ("o", "descriptions only in the code panel"),
+    ("w", "tree at full width (toggle)"),
+    ("i", "project overview"),
+    ("e", "open $EDITOR at the selected block"),
+    ("r", "regenerate the selected item"),
+    ("R", "refresh all outdated tree descriptions"),
+    ("?", "this help"),
+    ("q", "quit (Esc closes a window)"),
+    ("mouse", "click selects and expands or collapses, wheel scrolls"),
+];
+
 pub fn human_size(bytes: u64) -> String {
     const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
     let mut value = bytes as f64;

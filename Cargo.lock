@@ -1389,6 +1389,7 @@ dependencies = [
  "shell-words",
  "syntect",
  "tempfile",
+ "unicode-width",
 ]
 
 [[package]]

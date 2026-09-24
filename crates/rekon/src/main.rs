@@ -1,5 +1,7 @@
 //! `rekon` binary: CLI subcommands; without a subcommand it opens the TUI.
 
+mod tui;
+
 use std::io::{IsTerminal, Read, Write};
 use std::process::ExitCode;
 
@@ -108,8 +110,8 @@ fn main() -> ExitCode {
 fn run(cli: Cli) -> Result<u8> {
     let cwd = std::env::current_dir()?;
     let Some(command) = cli.command else {
-        eprintln!("rekon: the TUI is not available yet; see `rekon --help`");
-        return Ok(USAGE);
+        tui::run(std::sync::Arc::new(Ctx::open(&cwd)?))?;
+        return Ok(0);
     };
     match command {
         Cmd::Init {

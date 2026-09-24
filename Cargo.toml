@@ -19,5 +19,6 @@ wait-timeout = "0.2"
 shell-words = "1"
 clap = { version = "4", features = ["derive"] }
 ratatui = "0.30"
+unicode-width = "0.2"
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
 tempfile = "3"
