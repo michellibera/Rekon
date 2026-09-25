@@ -861,6 +861,13 @@ impl App {
                 } else if !self.has_headers() {
                     self.code_panel.sel = index;
                     self.code_sel_key = Some(row.target.clone());
+                } else if let Some(i) = (0..index)
+                    .rev()
+                    .find(|&i| self.code_rows[i].kind == RowKind::BlockHeader)
+                {
+                    // A code line selects its block: the nearest header above it.
+                    self.code_panel.sel = i;
+                    self.code_sel_key = Some(self.code_rows[i].target.clone());
                 }
             }
         }

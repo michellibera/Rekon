@@ -180,9 +180,88 @@ pub struct BlockView<'a> {
     pub width: usize,
 }
 
-/// Header per visible block (`{indent}{marker} {start}–{end}  {summary}`); under a
-/// collapsed block or a leaf its code lines (`{indent}│ {nr:>4} {code}`); an expanded
-/// block shows its children one level deeper instead of its code.
+/// A block description may add rows under short code up to this many lines.
+const MAX_DESC_LINES: usize = 4;
+/// Below this panel width blocks get no description column (the footer still has it).
+const MIN_WIDTH_FOR_DESC: usize = 40;
+
+/// Width of the description column to the right of the code.
+fn desc_width(width: usize) -> usize {
+    if width < MIN_WIDTH_FOR_DESC {
+        0
+    } else {
+        (width * 2 / 5).clamp(16, 48)
+    }
+}
+
+/// Word-wraps `s` to lines of at most `width` columns; overlong words are cut.
+pub fn wrap(s: &str, width: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    if width == 0 {
+        return out;
+    }
+    let mut cur = String::new();
+    for word in s.split_whitespace() {
+        let word = fit(word, width);
+        if cur.is_empty() {
+            cur = word;
+        } else if cur.width() + 1 + word.width() <= width {
+            cur.push(' ');
+            cur.push_str(&word);
+        } else {
+            out.push(std::mem::replace(&mut cur, word));
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// `s` wrapped into at most `rows` lines; the last one ends with "…" when text is left.
+fn wrap_into(s: &str, width: usize, rows: usize) -> Vec<String> {
+    let mut lines = wrap(s, width);
+    if lines.len() > rows {
+        lines.truncate(rows);
+        if let Some(last) = lines.last_mut() {
+            *last = fit(&format!("{last}…"), width);
+        }
+    }
+    lines
+}
+
+/// Keeps the first `width` columns of `spans`; returns them with the width used.
+fn clip(spans: Vec<Span<'static>>, width: usize) -> (Vec<Span<'static>>, usize) {
+    let mut out = Vec::new();
+    let mut used = 0;
+    for s in spans {
+        let w = s.content.width();
+        if used + w <= width {
+            used += w;
+            out.push(s);
+            continue;
+        }
+        let mut cut = String::new();
+        for c in s.content.chars() {
+            let cw = c.width().unwrap_or(0);
+            if used + cw > width {
+                break;
+            }
+            cut.push(c);
+            used += cw;
+        }
+        out.push(Span::styled(cut, s.style));
+        break;
+    }
+    (out, used)
+}
+
+/// Visible blocks, depth first. A block showing code (collapsed or leaf) is its code
+/// lines, the first one carrying the marker instead of the bar
+/// (`{indent}{marker} {nr:>4} {code}`), with the summary wrapped in a column on the
+/// right (extra rows without code when the summary is longer than the code). A block
+/// without code (expanded, or `o`) is a header line `{indent}{marker} {start}–{end}
+/// {summary}` followed by its children one level deeper.
 pub fn block_rows(view: &BlockView) -> Vec<Row> {
     let mut out = Vec::new();
     push_blocks(view, view.blocks, 0, &mut out);
@@ -204,40 +283,80 @@ fn push_blocks(view: &BlockView, blocks: &[Block], depth: usize, out: &mut Vec<R
             "▸"
         };
         let indent = "  ".repeat(depth);
-        let range = format!("{}–{}", b.lines.0, b.lines.1);
-        let used = indent.width() + marker.width() + 1 + range.width() + 2;
-        let summary = fit(&b.summary, view.width.saturating_sub(used));
-        out.push(Row {
-            depth,
-            kind: RowKind::BlockHeader,
-            target: RowRef::Block(b.lines),
-            line: Line::from(vec![
-                Span::raw(indent.clone()),
-                Span::styled(marker.to_string(), Style::new().fg(level_color(depth))),
-                Span::raw(" "),
-                Span::styled(range, DIM),
-                Span::raw("  "),
-                Span::styled(summary, Style::new().add_modifier(Modifier::BOLD)),
-            ]),
-        });
-        if expanded && has_children {
-            push_blocks(view, b.children.as_deref().unwrap_or_default(), depth + 1, out);
-        } else if !view.desc_only {
-            for nr in b.lines.0..=b.lines.1 {
+        let bar = Style::new().fg(level_color(depth));
+        let shows_children = expanded && has_children;
+        if shows_children || view.desc_only {
+            let range = format!("{}–{}", b.lines.0, b.lines.1);
+            let used = indent.width() + marker.width() + 1 + range.width() + 2;
+            let summary = fit(&b.summary, view.width.saturating_sub(used));
+            out.push(Row {
+                depth,
+                kind: RowKind::BlockHeader,
+                target: RowRef::Block(b.lines),
+                line: Line::from(vec![
+                    Span::raw(indent),
+                    Span::styled(marker.to_string(), bar),
+                    Span::raw(" "),
+                    Span::styled(range, DIM),
+                    Span::raw("  "),
+                    Span::styled(summary, Style::new().add_modifier(Modifier::BOLD)),
+                ]),
+            });
+            if shows_children {
+                push_blocks(view, b.children.as_deref().unwrap_or_default(), depth + 1, out);
+            }
+            continue;
+        }
+
+        let desc_w = desc_width(view.width);
+        let code_w = view
+            .width
+            .saturating_sub(indent.width() + desc_w + usize::from(desc_w > 0));
+        let count = (b.lines.1 + 1).saturating_sub(b.lines.0) as usize;
+        let desc = wrap_into(&b.summary, desc_w, count.max(MAX_DESC_LINES));
+        // A short block with a longer description gets extra rows without code.
+        for k in 0..count.max(desc.len()) {
+            let nr = b.lines.0 + k as u32;
+            // A marker is narrower than the bar and its space, except the 2-column ⏳.
+            let gutter = if k > 0 {
+                "│ ".to_string()
+            } else if marker.width() >= 2 {
+                marker.to_string()
+            } else {
+                format!("{marker} ")
+            };
+            let mut row = if k < count {
                 let i = nr as usize - 1;
-                let prefix = vec![
-                    Span::raw(indent.clone()),
-                    Span::styled("│ ", Style::new().fg(level_color(depth))),
-                ];
                 let raw = view.lines.get(i).map_or("", String::as_str);
-                out.push(code_row(
+                code_row(
                     nr,
                     depth,
-                    prefix,
+                    vec![Span::styled(gutter, bar)],
                     view.highlighted.and_then(|h| h.get(i)),
                     raw,
-                ));
+                )
+            } else {
+                Row {
+                    depth,
+                    kind: RowKind::CodeLine,
+                    target: RowRef::Line(b.lines.1),
+                    line: Line::from(Span::styled(gutter, bar)),
+                }
+            };
+            let (body, used) = clip(row.line.spans, code_w);
+            let mut spans = vec![Span::raw(indent.clone())];
+            spans.extend(body);
+            spans.push(Span::raw(" ".repeat(code_w - used)));
+            if let Some(d) = desc.get(k) {
+                spans.push(Span::raw(" "));
+                spans.push(Span::raw(d.clone()));
             }
+            row.line = Line::from(spans);
+            if k == 0 {
+                row.kind = RowKind::BlockHeader;
+                row.target = RowRef::Block(b.lines);
+            }
+            out.push(row);
         }
     }
 }
@@ -283,7 +402,8 @@ mod tests {
     }
 
     fn text(row: &Row) -> String {
-        row.line.spans.iter().map(|s| s.content.as_ref()).collect()
+        let t: String = row.line.spans.iter().map(|s| s.content.as_ref()).collect();
+        t.trim_end().to_string()
     }
 
     fn nested() -> Vec<Block> {
@@ -315,11 +435,9 @@ mod tests {
         assert_eq!(
             render(&[], &[], false),
             [
-                "▸ 1–2  First",
-                "│    1 line1",
+                "▸    1 line1            First",
                 "│    2 line2",
-                "▸ 3–6  Second",
-                "│    3 line3",
+                "▸    3 line3            Second",
                 "│    4 line4",
                 "│    5 line5",
                 "│    6 line6",
@@ -332,18 +450,50 @@ mod tests {
         assert_eq!(
             render(&[(3, 6)], &[], false),
             [
-                "▸ 1–2  First",
-                "│    1 line1",
+                "▸    1 line1            First",
                 "│    2 line2",
                 "▾ 3–6  Second",
-                "  ▸ 3–4  Inner a",
-                "  │    3 line3",
+                "  ▸    3 line3          Inner a",
                 "  │    4 line4",
-                "  · 5–6  Inner b",
-                "  │    5 line5",
+                "  ·    5 line5          Inner b",
                 "  │    6 line6",
             ]
         );
+    }
+
+    #[test]
+    fn wrap_breaks_on_words_and_marks_leftover_text() {
+        assert_eq!(wrap("one two three", 7), ["one two", "three"]);
+        assert_eq!(wrap("abcdefgh ij", 4), ["abc…", "ij"]);
+        assert_eq!(wrap_into("one two three four", 7, 1), ["one tw…"]);
+        assert!(wrap("anything", 0).is_empty());
+    }
+
+    #[test]
+    fn long_summaries_add_rows_under_short_code() {
+        let lines = vec!["x".to_string()];
+        let blocks = vec![Block::new(1, 1, "a summary long enough for two lines")];
+        let no = |_: (u32, u32)| false;
+        let view = BlockView {
+            blocks: &blocks,
+            expanded: &no,
+            pending: &no,
+            desc_only: false,
+            lines: &lines,
+            highlighted: None,
+            width: 40,
+        };
+        let rows = block_rows(&view);
+        assert_eq!(
+            rows.iter().map(text).collect::<Vec<_>>(),
+            [
+                "▸    1 x                a summary long",
+                "│                       enough for two",
+                "│                       lines",
+            ]
+        );
+        assert_eq!(rows[0].kind, RowKind::BlockHeader);
+        assert!(rows[1..].iter().all(|r| r.kind == RowKind::CodeLine));
     }
 
     #[test]

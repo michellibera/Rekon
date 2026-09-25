@@ -193,13 +193,12 @@ fn opening_a_file_splits_it_once() {
     assert_eq!(
         fx.code_lines(),
         [
-            "▸ 1–4  Opis testowy: linie 1-4",
-            "│    1 fn main() {",
-            "│    2     run();",
+            "▸    1 fn main() {              Opis testowy: linie",
+            "│    2     run();               1-4",
             "│    3 }",
             "│    4",
-            "· 5–5  Opis testowy: linie 5-5",
-            "│    5 fn run() {}",
+            "·    5 fn run() {}              Opis testowy: linie",
+            "│                               5-5",
         ]
     );
     // Opening again reads the note.
@@ -222,14 +221,12 @@ fn expanding_splits_lazily_and_reuses_children() {
         fx.code_lines(),
         [
             "▾ 1–4  Opis testowy: linie 1-4",
-            "  · 1–2  Opis testowy: linie 1-2",
-            "  │    1 fn main() {",
-            "  │    2     run();",
-            "  · 3–4  Opis testowy: linie 3-4",
-            "  │    3 }",
-            "  │    4",
-            "· 5–5  Opis testowy: linie 5-5",
-            "│    5 fn run() {}",
+            "  ·    1 fn main() {            Opis testowy: linie",
+            "  │    2     run();             1-2",
+            "  ·    3 }                      Opis testowy: linie",
+            "  │    4                        3-4",
+            "·    5 fn run() {}              Opis testowy: linie",
+            "│                               5-5",
         ]
     );
     fx.key(KeyCode::Left); // collapse
@@ -249,7 +246,7 @@ fn selection_jumps_between_headers_and_o_hides_code() {
     assert_eq!(fx.app.code_panel.sel, 0);
     fx.key(KeyCode::Down);
     fx.draw();
-    assert_eq!(fx.app.code_panel.sel, 5, "next header, over the code lines");
+    assert_eq!(fx.app.code_panel.sel, 4, "next block, over the code lines");
     fx.key(KeyCode::Up);
     fx.draw();
     assert_eq!(fx.app.code_panel.sel, 0);
@@ -282,8 +279,11 @@ fn click_on_block_header_toggles_it() {
     fx.wait_jobs();
     assert!(fx.code_lines()[0].starts_with("▾ 1–4"));
     fx.app.on_mouse(click(0));
-    assert!(fx.code_lines()[0].starts_with("▸ 1–4"), "second click collapses");
-    // A click on a code line does not move the selection off the headers.
+    assert!(
+        fx.code_lines()[0].starts_with("▸    1 fn main() {"),
+        "second click collapses"
+    );
+    // A click on a code line selects its block.
     fx.app.on_mouse(click(2));
     fx.draw();
     assert_eq!(fx.app.code_panel.sel, 0);
