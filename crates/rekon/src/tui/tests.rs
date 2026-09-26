@@ -221,10 +221,10 @@ fn expanding_splits_lazily_and_reuses_children() {
         fx.code_lines(),
         [
             "▾ 1–4  Opis testowy: linie 1-4",
-            "  ·    1 fn main() {            Opis testowy: linie",
-            "  │    2     run();             1-2",
-            "  ·    3 }                      Opis testowy: linie",
-            "  │    4                        3-4",
+            "·    1 fn main() {              Opis testowy: linie",
+            "│    2     run();               1-2",
+            "·    3 }                        Opis testowy: linie",
+            "│    4                          3-4",
             "·    5 fn run() {}              Opis testowy: linie",
             "│                               5-5",
         ]

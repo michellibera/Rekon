@@ -8,7 +8,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use rekon_core::text;
 
 use super::app::{App, Focus, Popup};
-use super::rows::{DIM, Row, RowKind};
+use super::rows::{self, DIM, Row};
 
 const TREE_PERCENT: u16 = 45;
 const FOCUS_BORDER: Style = Style::new().fg(Color::Cyan);
@@ -108,8 +108,8 @@ fn draw_header(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-/// Draws the visible slice of rows and highlights the selected one, together with the
-/// code lines of a selected block.
+/// Draws the visible slice of rows and highlights the selected one, together with
+/// everything a selected block contains.
 pub fn draw_rows(f: &mut Frame, rows: &[Row], area: Rect, offset: usize, sel: usize, focused: bool) {
     let visible: Vec<Line> = rows
         .iter()
@@ -121,12 +121,7 @@ pub fn draw_rows(f: &mut Frame, rows: &[Row], area: Rect, offset: usize, sel: us
     if sel >= rows.len() {
         return;
     }
-    let mut end = sel + 1;
-    if rows[sel].kind == RowKind::BlockHeader {
-        while rows.get(end).is_some_and(|r| r.kind == RowKind::CodeLine) {
-            end += 1;
-        }
-    }
+    let end = rows::selection_end(rows, sel);
     let first = sel.max(offset);
     let last = end.min(offset + area.height as usize);
     if first < last {

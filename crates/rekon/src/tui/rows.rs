@@ -28,6 +28,8 @@ pub enum RowKind {
     File,
     BlockHeader,
     CodeLine,
+    /// Empty row around the header of a split block.
+    Spacer,
 }
 
 /// What a row points at.
@@ -51,6 +53,9 @@ pub struct Row {
 
 pub const DIM: Style = Style::new().fg(Color::DarkGray);
 pub const WARN: Style = Style::new().fg(Color::Yellow);
+/// Block descriptions in the code panel: italic in a tone the syntax theme does not use,
+/// so they never read as code.
+pub const BLOCK_DESC: Style = Style::new().fg(Color::Rgb(130, 200, 220)).add_modifier(Modifier::ITALIC);
 
 /// Tree nodes visible with the given expanded folders: (node, depth), root excluded.
 pub fn visible_nodes(tree: &Tree, expanded: &HashSet<String>) -> Vec<(usize, usize)> {
@@ -258,10 +263,11 @@ fn clip(spans: Vec<Span<'static>>, width: usize) -> (Vec<Span<'static>>, usize) 
 
 /// Visible blocks, depth first. A block showing code (collapsed or leaf) is its code
 /// lines, the first one carrying the marker instead of the bar
-/// (`{indent}{marker} {nr:>4} {code}`), with the summary wrapped in a column on the
+/// (`{marker} {nr:>4} {code}`), with the summary wrapped in a column on the
 /// right (extra rows without code when the summary is longer than the code). A block
-/// without code (expanded, or `o`) is a header line `{indent}{marker} {start}–{end}
-/// {summary}` followed by its children one level deeper.
+/// without code (expanded, or `o`) is a header line `{marker} {start}–{end} {summary}`
+/// followed by its children one level deeper, told apart by bar color, not indentation.
+/// Outside `o` such a header gets an empty row above and below it.
 pub fn block_rows(view: &BlockView) -> Vec<Row> {
     let mut out = Vec::new();
     push_blocks(view, view.blocks, 0, &mut out);
@@ -282,26 +288,31 @@ fn push_blocks(view: &BlockView, blocks: &[Block], depth: usize, out: &mut Vec<R
         } else {
             "▸"
         };
-        let indent = "  ".repeat(depth);
         let bar = Style::new().fg(level_color(depth));
         let shows_children = expanded && has_children;
         if shows_children || view.desc_only {
+            let spaced = shows_children && !view.desc_only;
+            if spaced {
+                push_spacer(depth, b.lines, out);
+            }
             let range = format!("{}–{}", b.lines.0, b.lines.1);
-            let used = indent.width() + marker.width() + 1 + range.width() + 2;
+            let used = marker.width() + 1 + range.width() + 2;
             let summary = fit(&b.summary, view.width.saturating_sub(used));
             out.push(Row {
                 depth,
                 kind: RowKind::BlockHeader,
                 target: RowRef::Block(b.lines),
                 line: Line::from(vec![
-                    Span::raw(indent),
                     Span::styled(marker.to_string(), bar),
                     Span::raw(" "),
                     Span::styled(range, DIM),
                     Span::raw("  "),
-                    Span::styled(summary, Style::new().add_modifier(Modifier::BOLD)),
+                    Span::styled(summary, BLOCK_DESC.add_modifier(Modifier::BOLD)),
                 ]),
             });
+            if spaced {
+                push_spacer(depth, b.lines, out);
+            }
             if shows_children {
                 push_blocks(view, b.children.as_deref().unwrap_or_default(), depth + 1, out);
             }
@@ -309,9 +320,7 @@ fn push_blocks(view: &BlockView, blocks: &[Block], depth: usize, out: &mut Vec<R
         }
 
         let desc_w = desc_width(view.width);
-        let code_w = view
-            .width
-            .saturating_sub(indent.width() + desc_w + usize::from(desc_w > 0));
+        let code_w = view.width.saturating_sub(desc_w + usize::from(desc_w > 0));
         let count = (b.lines.1 + 1).saturating_sub(b.lines.0) as usize;
         let desc = wrap_into(&b.summary, desc_w, count.max(MAX_DESC_LINES));
         // A short block with a longer description gets extra rows without code.
@@ -343,13 +352,11 @@ fn push_blocks(view: &BlockView, blocks: &[Block], depth: usize, out: &mut Vec<R
                     line: Line::from(Span::styled(gutter, bar)),
                 }
             };
-            let (body, used) = clip(row.line.spans, code_w);
-            let mut spans = vec![Span::raw(indent.clone())];
-            spans.extend(body);
+            let (mut spans, used) = clip(row.line.spans, code_w);
             spans.push(Span::raw(" ".repeat(code_w - used)));
             if let Some(d) = desc.get(k) {
                 spans.push(Span::raw(" "));
-                spans.push(Span::raw(d.clone()));
+                spans.push(Span::styled(d.clone(), BLOCK_DESC));
             }
             row.line = Line::from(spans);
             if k == 0 {
@@ -359,6 +366,37 @@ fn push_blocks(view: &BlockView, blocks: &[Block], depth: usize, out: &mut Vec<R
             out.push(row);
         }
     }
+}
+
+/// End (exclusive) of the rows highlighted with row `sel`. A block header takes its own
+/// code lines, the spacer under it and every row of its children (rows deeper than it).
+pub fn selection_end(rows: &[Row], sel: usize) -> usize {
+    let mut end = sel + 1;
+    let Some(head) = rows.get(sel).filter(|r| r.kind == RowKind::BlockHeader) else {
+        return end;
+    };
+    while let Some(r) = rows.get(end) {
+        let own = r.depth == head.depth
+            && (r.kind == RowKind::CodeLine || (r.kind == RowKind::Spacer && end == sel + 1));
+        if r.depth <= head.depth && !own {
+            break;
+        }
+        end += 1;
+    }
+    end
+}
+
+/// Adds an empty row unless the list starts here or already ends with one.
+fn push_spacer(depth: usize, lines: (u32, u32), out: &mut Vec<Row>) {
+    if out.last().is_none_or(|r| r.kind == RowKind::Spacer) {
+        return;
+    }
+    out.push(Row {
+        depth,
+        kind: RowKind::Spacer,
+        target: RowRef::Line(lines.0),
+        line: Line::default(),
+    });
 }
 
 #[cfg(test)]
@@ -452,13 +490,37 @@ mod tests {
             [
                 "▸    1 line1            First",
                 "│    2 line2",
+                "",
                 "▾ 3–6  Second",
-                "  ▸    3 line3          Inner a",
-                "  │    4 line4",
-                "  ·    5 line5          Inner b",
-                "  │    6 line6",
+                "",
+                "▸    3 line3            Inner a",
+                "│    4 line4",
+                "·    5 line5            Inner b",
+                "│    6 line6",
             ]
         );
+    }
+
+    #[test]
+    fn selection_of_a_split_block_covers_its_children() {
+        let lines: Vec<String> = (1..=6).map(|i| format!("line{i}")).collect();
+        let blocks = nested();
+        let exp = |r: (u32, u32)| r == (3, 6);
+        let no = |_: (u32, u32)| false;
+        let view = BlockView {
+            blocks: &blocks,
+            expanded: &exp,
+            pending: &no,
+            desc_only: false,
+            lines: &lines,
+            highlighted: None,
+            width: 40,
+        };
+        let rows = block_rows(&view);
+        // 0-1 First, 2 spacer, 3 Second header, 4 spacer, 5-8 children.
+        assert_eq!(selection_end(&rows, 0), 2, "collapsed block: its code lines");
+        assert_eq!(selection_end(&rows, 3), rows.len(), "split block: spacer and children");
+        assert_eq!(selection_end(&rows, 5), 7, "child: only its own lines");
     }
 
     #[test]
@@ -500,7 +562,7 @@ mod tests {
     fn descriptions_only_and_pending_marker() {
         assert_eq!(
             render(&[(3, 6)], &[(3, 4)], true),
-            ["▸ 1–2  First", "▾ 3–6  Second", "  ⏳ 3–4  Inner a", "  · 5–6  Inner b"]
+            ["▸ 1–2  First", "▾ 3–6  Second", "⏳ 3–4  Inner a", "· 5–6  Inner b"]
         );
     }
 }
