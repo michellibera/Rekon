@@ -1,6 +1,6 @@
 # rekon
 
-Terminal map of a repository for one person. On the left: the project tree with a one-sentence
+Terminal map of a repository. On the left: the project tree with a one-sentence
 description of every file and folder. On the right: the code of the open file split into logical
 blocks with short descriptions; expanding a block splits it further, down to blocks of a few lines.
 
