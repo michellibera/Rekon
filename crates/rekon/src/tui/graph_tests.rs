@@ -6,7 +6,7 @@ use rekon_core::ontology::model::{Edge, Evidence, GRAPH_VERSION, Graph, Node, Sc
 use rekon_core::ontology::schema::Schema;
 
 use super::app::View;
-use super::graph::Sel;
+use super::graph::{Filter, Sel};
 use super::tests::{Fixture, fixture};
 
 const ORDER_SERVICE: &str = "component:order-service";
@@ -208,13 +208,111 @@ fn graph_starts_at_the_root_with_its_neighbors_below() {
 }
 
 #[test]
-fn arrow_down_expands_in_place_then_walks_through_the_relation() {
+fn many_neighbors_of_one_relation_wait_behind_a_group_marker() {
+    let mut fx = fixture(160, 40);
+    let mut g = graph(false);
+    for i in 0..6 {
+        let name = format!("Table{i}");
+        g.nodes.push(Node::new("DataEntity", &name));
+        g.edges
+            .push(Edge::new(ORDER_SERVICE, "reads", &format!("data-entity:table{i}")));
+    }
+    let path = fx.dir.path().join(".rekon/ontology/graph.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, serde_json::to_string(&g).unwrap()).unwrap();
+    fx.draw();
+    fx.key(KeyCode::Char('2'));
+    fx.draw();
+    fx.app.explorer.select(Sel::Node(ORDER_SERVICE.into()));
+    fx.key(KeyCode::Char(' '));
+    let screen = fx.draw().join("\n");
+    assert!(screen.contains("6 ▸"), "count on the marker: {screen}");
+    let line = fx
+        .app
+        .explorer
+        .frame
+        .edges
+        .iter()
+        .find(|e| e.id == format!("group:{ORDER_SERVICE}:reads"));
+    assert_eq!(
+        line.and_then(|e| e.label.as_ref()).map(|l| l.text.as_str()),
+        Some("reads"),
+        "relation on the branch"
+    );
+    assert!(!visible(&fx).contains(&"data-entity:table0".to_string()));
+    assert!(
+        visible(&fx).contains(&"process:create-order".to_string()),
+        "loose neighbors shown"
+    );
+    let group = Sel::Group(ORDER_SERVICE.into(), "reads".into());
+    fx.app.explorer.select(group.clone());
+    fx.key(KeyCode::Char(' '));
+    fx.draw();
+    assert!(fx.app.explorer.frame.rect(&group).is_none(), "marker gone");
+    assert!((0..6).all(|i| visible(&fx).contains(&format!("data-entity:table{i}"))));
+}
+
+fn drawn(fx: &Fixture) -> Vec<String> {
+    let mut v: Vec<String> = fx
+        .app
+        .explorer
+        .frame
+        .nodes
+        .iter()
+        .filter_map(|n| match &n.sel {
+            Sel::Node(id) => Some(id.clone()),
+            _ => None,
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn filters_show_only_matching_nodes_and_reveal_hidden_ones() {
+    let mut fx = open();
+    fx.key(KeyCode::Char('f'));
+    let screen = fx.draw().join(
+        "
+",
+    );
+    assert!(
+        screen.contains("[ ] emits  (1)"),
+        "nothing picked at the start: {screen}"
+    );
+    fx.key(KeyCode::Esc);
+    // `emits` joins OrderService and OrderCreated; OrderCreated was hidden.
+    assert!(fx.app.explorer.toggle_filter(Filter::Relation("emits".into())));
+    fx.draw();
+    assert_eq!(drawn(&fx), [ORDER_SERVICE, ORDER_CREATED]);
+    let emits = fx.app.explorer.frame.edges.iter().find(|e| e.id == EMITS);
+    assert!(emits.is_some(), "the picked relation is drawn");
+    assert_eq!(
+        fx.app.explorer.frame.edges.iter().filter(|e| !e.more).count(),
+        1,
+        "only it"
+    );
+    // A node type instead: only its nodes.
+    fx.app.explorer.toggle_filter(Filter::Relation("emits".into()));
+    fx.app.explorer.toggle_filter(Filter::Kind("DataEntity".into()));
+    fx.draw();
+    assert_eq!(drawn(&fx), ["data-entity:order"], "revealed through OrderService");
+    // Nothing picked: the revealed nodes stay, the others come back.
+    let place = fx.app.explorer.nodes["data-entity:order"].clone();
+    fx.app.explorer.toggle_filter(Filter::Kind("DataEntity".into()));
+    fx.draw();
+    assert!(drawn(&fx).contains(&"system:shop".to_string()));
+    assert_eq!(fx.app.explorer.nodes["data-entity:order"], place);
+}
+
+#[test]
+fn space_expands_in_place_then_walks_through_the_relation() {
     let mut fx = open();
     fx.app.explorer.select(Sel::Node(ORDER_SERVICE.into()));
     fx.draw();
     let before = positions(&fx);
     let zoom = fx.app.explorer.zoom;
-    fx.key(KeyCode::Down);
+    fx.key(KeyCode::Char(' '));
     fx.draw();
     // Expanded: its neighbors appeared, the selection stayed, nothing visible moved.
     assert_eq!(sel(&fx), Some(Sel::Node(ORDER_SERVICE.into())));
@@ -230,7 +328,7 @@ fn arrow_down_expands_in_place_then_walks_through_the_relation() {
         assert!(p.y > parent.y, "{id} below OrderService");
         assert_eq!(p.parent.as_deref(), Some(ORDER_SERVICE));
     }
-    // Next ↓: the relation right below, then the node it leads to.
+    // Then ↓: the relation right below, then the node it leads to.
     fx.key(KeyCode::Down);
     fx.draw();
     let Some(Sel::Edge(edge)) = sel(&fx) else {
@@ -262,13 +360,13 @@ fn expanding_a_node_draws_its_edge_to_an_already_visible_node() {
     let mut fx = open();
     fx.app.explorer.select(Sel::Node(ORDER_SERVICE.into()));
     fx.draw();
-    fx.key(KeyCode::Down);
+    fx.key(KeyCode::Char(' '));
     fx.draw();
     let payment = fx.app.explorer.nodes[PAYMENT_SERVICE].clone();
     assert!(fx.app.explorer.frame.edges.iter().all(|e| e.id != CONSUMES));
     fx.app.explorer.select(Sel::Node(ORDER_CREATED.into()));
     fx.draw();
-    fx.key(KeyCode::Down);
+    fx.key(KeyCode::Char(' '));
     fx.draw();
     assert_eq!(sel(&fx), Some(Sel::Node(ORDER_CREATED.into())), "expanded, not moved");
     let consumes = fx
@@ -409,7 +507,7 @@ fn a_new_analysis_keeps_the_view() {
     let mut fx = open();
     fx.app.explorer.select(Sel::Node(ORDER_SERVICE.into()));
     fx.draw();
-    fx.key(KeyCode::Down);
+    fx.key(KeyCode::Char(' '));
     fx.draw();
     let before = positions(&fx);
     // graph.json replaced on disk (e.g. by `rekon ontology index`).
@@ -469,7 +567,11 @@ fn print_repository_graph() {
     fx.draw();
     fx.key(KeyCode::Char('2'));
     println!("{}", fx.draw().join("\n"));
-    let steps: Vec<String> = std::env::var("REKON_STEPS").unwrap_or_default().split(',').map(str::to_string).collect();
+    let steps: Vec<String> = std::env::var("REKON_STEPS")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::to_string)
+        .collect();
     for step in steps.iter().filter(|s| !s.is_empty()) {
         match step.as_str() {
             "down" => fx.key(KeyCode::Down),

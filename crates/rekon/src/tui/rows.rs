@@ -55,7 +55,9 @@ pub const DIM: Style = Style::new().fg(Color::DarkGray);
 pub const WARN: Style = Style::new().fg(Color::Yellow);
 /// Block descriptions in the code panel: italic in a tone the syntax theme does not use,
 /// so they never read as code.
-pub const BLOCK_DESC: Style = Style::new().fg(Color::Rgb(130, 200, 220)).add_modifier(Modifier::ITALIC);
+pub const BLOCK_DESC: Style = Style::new()
+    .fg(Color::Rgb(130, 200, 220))
+    .add_modifier(Modifier::ITALIC);
 
 /// Tree nodes visible with the given expanded folders: (node, depth), root excluded.
 pub fn visible_nodes(tree: &Tree, expanded: &HashSet<String>) -> Vec<(usize, usize)> {
@@ -376,8 +378,8 @@ pub fn selection_end(rows: &[Row], sel: usize) -> usize {
         return end;
     };
     while let Some(r) = rows.get(end) {
-        let own = r.depth == head.depth
-            && (r.kind == RowKind::CodeLine || (r.kind == RowKind::Spacer && end == sel + 1));
+        let own =
+            r.depth == head.depth && (r.kind == RowKind::CodeLine || (r.kind == RowKind::Spacer && end == sel + 1));
         if r.depth <= head.depth && !own {
             break;
         }

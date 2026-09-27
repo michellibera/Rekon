@@ -75,6 +75,8 @@ impl EvidenceNav {
 pub enum Popup {
     Overview(u16),
     Help,
+    /// Filters of the graph, with the cursor on this entry.
+    Filter(usize),
 }
 
 pub struct OpenFile {
@@ -714,6 +716,21 @@ impl App {
                 (Popup::Overview(s), KeyCode::Up | KeyCode::Char('k')) => {
                     self.popup = Some(Popup::Overview(s.saturating_sub(1)))
                 }
+                (Popup::Filter(_), KeyCode::Char('f')) => self.popup = None,
+                (Popup::Filter(i), KeyCode::Down | KeyCode::Char('j')) => {
+                    let last = self.explorer.filter_entries().len().saturating_sub(1);
+                    self.popup = Some(Popup::Filter((i + 1).min(last)))
+                }
+                (Popup::Filter(i), KeyCode::Up | KeyCode::Char('k')) => {
+                    self.popup = Some(Popup::Filter(i.saturating_sub(1)))
+                }
+                (Popup::Filter(i), KeyCode::Char(' ') | KeyCode::Enter) => {
+                    if let Some((f, _)) = self.explorer.filter_entries().into_iter().nth(i)
+                        && !self.explorer.toggle_filter(f)
+                    {
+                        self.notice = Some(text::reveal_stopped(super::graph::REVEAL_MAX));
+                    }
+                }
                 _ => {}
             }
             return;
@@ -776,7 +793,7 @@ impl App {
             KeyCode::Left if shift => self.explorer.pan(-8, 0),
             KeyCode::Right if shift => self.explorer.pan(8, 0),
             KeyCode::Up | KeyCode::Char('k') => self.explorer.go(Dir::Up),
-            KeyCode::Down | KeyCode::Char('j') => self.explorer.down(),
+            KeyCode::Down | KeyCode::Char('j') => self.explorer.go(Dir::Down),
             KeyCode::Left | KeyCode::Char('h') => self.explorer.go(Dir::Left),
             KeyCode::Right | KeyCode::Char('l') => self.explorer.go(Dir::Right),
             KeyCode::Char(' ') => self.explorer.toggle(),
@@ -795,6 +812,7 @@ impl App {
                     self.notice = Some(text::NO_LINEAGE.into());
                 }
             }
+            KeyCode::Char('f') => self.popup = Some(Popup::Filter(0)),
             KeyCode::Char('R') => self.start_ontology(None, false),
             KeyCode::Char('r') => {
                 let files = self.selection_files();
@@ -815,7 +833,7 @@ impl App {
         let evidence = match sel {
             Sel::Node(id) => g.node(id).map(|n| &n.evidence),
             Sel::Edge(id) => g.edge(id).map(|e| &e.evidence),
-            Sel::More(_) => None,
+            Sel::More(_) | Sel::Group(..) => None,
         };
         let mut files: Vec<String> = evidence.into_iter().flatten().map(|e| e.file.clone()).collect();
         files.sort();
@@ -843,6 +861,7 @@ impl App {
                 None => return,
             },
             Sel::More(id) => return self.explorer.show_more(&id.clone()),
+            Sel::Group(id, label) => return self.explorer.open_group(&id.clone(), &label.clone()),
         };
         if items.is_empty() {
             self.notice = Some(text::NO_EVIDENCE.into());
@@ -1408,6 +1427,14 @@ impl App {
             Sel::More(id) => {
                 let count = self.explorer.more.get(id).map_or(0, |m| m.count);
                 text::more_line(count, g.node(id).map_or("", |n| n.name.as_str()))
+            }
+            Sel::Group(id, label) => {
+                let count = self
+                    .explorer
+                    .groups
+                    .get(&(id.clone(), label.clone()))
+                    .map_or(0, |m| m.count);
+                text::group_line(label, count, g.node(id).map_or("", |n| n.name.as_str()))
             }
         }
     }

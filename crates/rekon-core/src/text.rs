@@ -62,6 +62,13 @@ pub fn stop_hook_reason(exe: &str, paths: &[String]) -> String {
 pub const TREE_TITLE: &str = "Tree";
 pub const CODE_TITLE_EMPTY: &str = "Code";
 pub const OVERVIEW_TITLE: &str = "Project overview";
+pub const FILTER_TITLE: &str = "Graph filters: nothing picked shows all (Space: pick, f or Esc: close)";
+pub const FILTER_KINDS: &str = "Node types";
+pub const FILTER_RELATIONS: &str = "Relations";
+
+pub fn reveal_stopped(max: usize) -> String {
+    format!("filters revealed the first {max} matching nodes; pick more to narrow them")
+}
 pub const HELP_TITLE: &str = "Keys";
 pub const NO_OVERVIEW: &str = "No overview yet. Run `rekon init` (or wait for the background init).";
 pub const SELECT_FILE: &str = "Select a file in the tree to see its code.";
@@ -69,7 +76,6 @@ pub const SPLITTING: &str = "splitting into blocks…";
 pub const HELP_HINT: &str = "? help";
 pub const BLOCKS_OUTDATED: &str = "blocks outdated, r splits again";
 pub const NO_BLOCKS: &str = "no blocks, r splits";
-
 pub fn too_long_for_blocks(lines: u32, max: u32) -> String {
     format!("{lines} lines, more than max_segment_lines ({max}): no blocks")
 }
@@ -107,6 +113,10 @@ pub const TAB_ONTOLOGY: &str = "Ontology";
 pub const NO_ONTOLOGY: &str = "No ontology yet. R maps this repository onto the ontology with the model (like      `rekon ontology index`); later runs analyze only changed files.";
 pub const ONTOLOGY_RUNNING: &str = "Analyzing the repository; the graph appears when the analysis ends.";
 pub const NO_EVIDENCE: &str = "no evidence for this element";
+pub fn group_line(relation: &str, count: usize, name: &str) -> String {
+    format!("{count} neighbors of {name} by \"{relation}\": Space or Enter shows them")
+}
+
 pub const HELP_ONTOLOGY_TITLE: &str = "Ontology view";
 
 /// Title of the code panel showing evidence: what it proves, which one, where, why.
@@ -140,19 +150,25 @@ pub fn edge_line(title: &str, confidence: f64, evidence: usize) -> String {
 }
 
 pub fn more_line(count: usize, name: &str) -> String {
-    format!("{count} more neighbors of {name}: ↓, Space or Enter shows them")
+    format!("{count} more neighbors of {name}: Space or Enter shows them")
 }
 
 pub const HELP_ONTOLOGY: &[(&str, &str)] = &[
     ("arrows, hjkl", "move to the nearest element in that direction"),
-    ("↓ on ▸ node", "expand: its neighbors appear below it"),
-    ("Space", "expand or collapse the selected node"),
+    (
+        "Space",
+        "expand or collapse the selected node (its neighbors appear below it)",
+    ),
     ("Backspace", "collapse the node (or the node above it)"),
     ("Enter", "show the evidence in the code panel (again: the next one)"),
     ("[ / ]", "previous / next evidence"),
     ("Esc", "select the node one level up"),
     ("+ / - / 0", "zoom in / out / back to 100%"),
     ("c / Home", "center on the selection / go to the root"),
+    (
+        "f",
+        "filters: only nodes of the picked types / joined by the picked relations",
+    ),
     ("L", "reveal the data lineage (derivedFrom) of the selection"),
     ("R / r", "analyze changed files / the selection's files again"),
     (
@@ -160,6 +176,12 @@ pub const HELP_ONTOLOGY: &[(&str, &str)] = &[
         "click selects, double click expands, drag pans or moves a node, wheel zooms",
     ),
 ];
+
+/// Marker of a node's hidden neighbors joined by one relation (the relation is on
+/// the line to it).
+pub fn relation_group(count: usize) -> String {
+    format!("{count} ▸")
+}
 
 pub fn human_size(bytes: u64) -> String {
     const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];

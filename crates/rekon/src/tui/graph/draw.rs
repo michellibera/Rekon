@@ -1,6 +1,7 @@
 //! Drawing the explorer into the terminal buffer: edge routes as box-drawing lines
 //! (joined where they meet), arrows, node boxes colored by type, relation labels.
 
+use std::collections::HashSet;
 use std::str::FromStr;
 
 use ratatui::Frame as TuiFrame;
@@ -24,6 +25,8 @@ const SELECTED: Style = Style::new().fg(Color::Yellow).add_modifier(Modifier::BO
 const SEL_FOCUSED: Color = Color::Rgb(26, 50, 74);
 const SEL_UNFOCUSED: Color = Color::Rgb(46, 48, 54);
 const DIM: Style = Style::new().fg(Color::DarkGray);
+/// Everything outside the focus of the selection.
+const FADED: Color = Color::Rgb(60, 62, 68);
 
 const UP: u8 = 1;
 const DOWN: u8 = 2;
@@ -146,10 +149,73 @@ pub fn draw(f: &mut TuiFrame, ex: &mut Explorer, focused: bool, message: Option<
             put_str(buf, area, l.x, l.y, &l.text, if hot { EDGE_SELECTED } else { LABEL });
         }
     }
+    if let Some(sel) = &sel {
+        dim_outside_focus(buf, &ex.frame, &g, sel);
+    }
     if (ex.zoom - 1.0).abs() > 1e-9 {
         let z = format!(" {:.0}% ", ex.zoom * 100.0);
         let x = i32::from(area.x) + i32::from(area.width) - z.width() as i32;
         put_str(buf, area, x, i32::from(area.y), &z, DIM);
+    }
+}
+
+/// Grays out everything but the focus: the selected node with its neighbors and the
+/// edges between them, or the selected edge with its two ends.
+fn dim_outside_focus(buf: &mut Buffer, frame: &layout::Frame, g: &GraphIndex, sel: &Sel) {
+    let ends = |id: &str| g.edge(id).map(|e| [e.source.clone(), e.target.clone()]);
+    let mut nodes: HashSet<String> = HashSet::new();
+    let mut edges: HashSet<&str> = HashSet::new();
+    match sel {
+        Sel::Node(id) | Sel::More(id) | Sel::Group(id, _) => {
+            nodes.insert(id.clone());
+            for e in &frame.edges {
+                let touches = if e.more {
+                    e.from == *id
+                } else {
+                    ends(&e.id).is_some_and(|ends| ends.contains(id))
+                };
+                if touches {
+                    edges.insert(&e.id);
+                    nodes.extend(ends(&e.id).into_iter().flatten());
+                }
+            }
+        }
+        Sel::Edge(id) => {
+            edges.insert(id);
+            nodes.extend(ends(id).into_iter().flatten());
+        }
+    }
+    let mut keep: Vec<IRect> = Vec::new();
+    for n in &frame.nodes {
+        let focused = match &n.sel {
+            Sel::Node(id) => nodes.contains(id),
+            Sel::More(parent) => edges.contains(format!("more:{parent}").as_str()) || n.sel == *sel,
+            Sel::Group(parent, label) => edges.contains(format!("group:{parent}:{label}").as_str()) || n.sel == *sel,
+            Sel::Edge(_) => false,
+        };
+        if focused {
+            keep.push(n.rect);
+        }
+    }
+    for e in frame.edges.iter().filter(|e| edges.contains(e.id.as_str())) {
+        keep.extend(
+            layout::cells(&e.points)
+                .into_iter()
+                .map(|(x, y)| IRect::new(x, y, 1, 1)),
+        );
+        keep.extend(e.label.as_ref().map(layout::Label::rect));
+        keep.extend(e.exit.map(|(x, y, _)| IRect::new(x, y, 1, 1)));
+    }
+    let a = IRect::from(frame.area);
+    for y in a.y..=a.bottom() {
+        for x in a.x..=a.right() {
+            if keep.iter().any(|r| r.contains(x, y)) {
+                continue;
+            }
+            if let Some(cell) = buf.cell_mut((x as u16, y as u16)) {
+                cell.set_style(Style::new().fg(FADED).remove_modifier(Modifier::BOLD));
+            }
+        }
     }
 }
 
@@ -255,9 +321,18 @@ fn draw_nodes(buf: &mut Buffer, ex: &Explorer, g: &GraphIndex, focused: bool) {
         let fill = selected.then_some(if focused { SEL_FOCUSED } else { SEL_UNFOCUSED });
         let r = b.rect;
         match &b.sel {
-            Sel::More(parent) => {
-                let count = ex.more.get(parent).map_or(0, |m| m.count);
-                let label = text::more_neighbors(count);
+            Sel::More(_) | Sel::Group(..) => {
+                let label = match &b.sel {
+                    Sel::Group(parent, relation) => {
+                        let count = ex
+                            .groups
+                            .get(&(parent.clone(), relation.clone()))
+                            .map_or(0, |m| m.count);
+                        text::relation_group(count)
+                    }
+                    Sel::More(parent) => text::more_neighbors(ex.more.get(parent).map_or(0, |m| m.count)),
+                    _ => unreachable!(),
+                };
                 let border = if selected { SELECTED } else { DIM };
                 if b.compact {
                     put_str(buf, area, r.x, r.y, &fit(&label, r.w), border);

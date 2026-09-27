@@ -8,13 +8,13 @@ mod draw;
 mod layout;
 mod nav;
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use ratatui::layout::Rect;
-use rekon_core::ontology::graph::{self, GraphIndex};
+use rekon_core::ontology::graph::{self, GraphIndex, Neighbor};
 use rekon_core::ontology::model::{Edge, Node};
 use rekon_core::text;
 use unicode_width::UnicodeWidthStr;
@@ -33,6 +33,10 @@ pub const H_GAP: i32 = 2;
 const TRUNK_GAP: i32 = 3;
 /// Neighbors revealed by one expansion; the rest wait behind "+N more".
 pub const PAGE: usize = 12;
+/// Hidden neighbors of one relation from this many on wait behind a group marker.
+const GROUP_MIN: usize = 5;
+/// Picking a filter reveals at most this many hidden matching nodes.
+pub const REVEAL_MAX: usize = 200;
 /// Longest name shown in a box, in columns.
 pub const MAX_NAME: usize = 32;
 const ZOOMS: [f64; 7] = [0.4, 0.55, 0.75, 1.0, 1.25, 1.5, 2.0];
@@ -46,6 +50,23 @@ pub enum Sel {
     Edge(String),
     /// "+N more" marker of the node with this id.
     More(String),
+    /// Group marker of the node's hidden neighbors joined by one relation (label).
+    Group(String, String),
+}
+
+/// A pick in the filters: a node type or a relation.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Filter {
+    Kind(String),
+    Relation(String),
+}
+
+/// What a place in a row of revealed neighbors holds.
+enum Slot<'a> {
+    Node(&'a String),
+    /// Group marker: relation label, hidden neighbors.
+    Group(&'a String, usize),
+    More,
 }
 
 /// A visible node: world position of its top-left corner, and how it got here.
@@ -96,6 +117,12 @@ pub struct Explorer {
     /// Visible nodes in the order they appeared (drawing order).
     pub order: Vec<String>,
     pub more: HashMap<String, More>,
+    /// Group markers by (node, relation label).
+    pub groups: BTreeMap<(String, String), More>,
+    /// Node types and relations picked in the filters; none picked shows everything.
+    pub filters: HashSet<Filter>,
+    /// With filters: the nodes that match them, the only ones shown.
+    relevant: Option<HashSet<String>>,
     /// Edges shown although neither end is expanded (data lineage).
     pub extra: HashSet<String>,
     pub sel: Option<Sel>,
@@ -126,6 +153,9 @@ impl Default for Explorer {
             nodes: HashMap::new(),
             order: Vec::new(),
             more: HashMap::new(),
+            groups: BTreeMap::new(),
+            filters: HashSet::new(),
+            relevant: None,
             extra: HashSet::new(),
             sel: None,
             cam: (0.0, 0.0),
@@ -181,10 +211,12 @@ impl Explorer {
             }
         }
         self.more.clear();
+        self.groups.clear();
         self.extra.retain(|e| g.edge(e).is_some());
         self.graph = Some(g);
+        self.relevant = self.find_relevant();
         let valid = match &self.sel {
-            Some(Sel::Node(id)) | Some(Sel::More(id)) => self.nodes.contains_key(id),
+            Some(Sel::Node(id)) | Some(Sel::More(id)) | Some(Sel::Group(id, _)) => self.nodes.contains_key(id),
             Some(Sel::Edge(id)) => self.graph.as_ref().is_some_and(|g| g.edge(id).is_some()),
             None => true,
         };
@@ -202,10 +234,7 @@ impl Explorer {
                 .cloned()
                 .collect();
             for id in expanded {
-                let hidden = self.hidden(&id).len();
-                if hidden > 0 {
-                    self.place_more(&id, hidden);
-                }
+                self.place_markers(&id);
             }
         }
     }
@@ -240,8 +269,175 @@ impl Explorer {
 
     // ----- what is shown -----
 
-    /// Is this edge drawn: both ends visible and one of them expanded (or lineage)?
+    /// Can this node be shown with the filters?
+    pub fn shown(&self, id: &str) -> bool {
+        self.relevant.as_ref().is_none_or(|r| r.contains(id))
+    }
+
+    /// Edges of a node to nodes the filters let through, with their other ends.
+    fn links(&self, id: &str) -> Vec<Neighbor<'_>> {
+        let Some(g) = &self.graph else { return Vec::new() };
+        g.neighbors(id)
+            .into_iter()
+            .filter(|nb| self.shown(&nb.node.id))
+            .collect()
+    }
+
+    /// Is a relation picked, or no relation at all?
+    fn relation_passes(&self, relation: &str) -> bool {
+        let picked = self.filters.iter().any(|f| matches!(f, Filter::Relation(_)));
+        !picked || self.filters.contains(&Filter::Relation(relation.to_string()))
+    }
+
+    /// Nodes matching the filters: of a picked type, and with a picked relation the
+    /// two ends of its edges; `None` with nothing picked.
+    fn find_relevant(&self) -> Option<HashSet<String>> {
+        let g = self.graph.as_ref()?;
+        if self.filters.is_empty() {
+            return None;
+        }
+        let by_kind = self.filters.iter().any(|f| matches!(f, Filter::Kind(_)));
+        let by_relation = self.filters.iter().any(|f| matches!(f, Filter::Relation(_)));
+        let kind_ok = |kind: &str| !by_kind || self.filters.contains(&Filter::Kind(kind.to_string()));
+        let mut out = HashSet::new();
+        if by_relation {
+            for e in g.graph.edges.iter().filter(|e| self.relation_passes(&e.relation)) {
+                if let (Some(s), Some(t)) = (g.node(&e.source), g.node(&e.target))
+                    && kind_ok(&s.kind)
+                    && kind_ok(&t.kind)
+                {
+                    out.insert(s.id.clone());
+                    out.insert(t.id.clone());
+                }
+            }
+        } else {
+            out.extend(g.graph.nodes.iter().filter(|n| kind_ok(&n.kind)).map(|n| n.id.clone()));
+        }
+        Some(out)
+    }
+
+    /// Places the matching nodes not visible yet, expanding the graph from the root
+    /// along the shortest path to each (nodes on the way are placed too, and shown
+    /// again without filters). Returns false when it stopped at [`REVEAL_MAX`].
+    fn reveal_relevant(&mut self) -> bool {
+        let (Some(g), Some(relevant)) = (self.graph.clone(), self.relevant.clone()) else {
+            return true;
+        };
+        let Some(root) = self.root() else { return true };
+        let mut came_from: HashMap<String, String> = HashMap::new();
+        let mut queue = VecDeque::from([root.clone()]);
+        let mut seen = HashSet::from([root]);
+        while let Some(id) = queue.pop_front() {
+            for nb in g.neighbors(&id) {
+                if seen.insert(nb.node.id.clone()) {
+                    came_from.insert(nb.node.id.clone(), id.clone());
+                    queue.push_back(nb.node.id.clone());
+                }
+            }
+        }
+        let targets: Vec<String> = g
+            .graph
+            .nodes
+            .iter()
+            .filter(|n| relevant.contains(&n.id) && !self.nodes.contains_key(&n.id))
+            .map(|n| n.id.clone())
+            .collect();
+        let mut complete = true;
+        for (k, target) in targets.into_iter().enumerate() {
+            if k >= REVEAL_MAX {
+                complete = false;
+                break;
+            }
+            // Up to the first visible node, then placed back down from it.
+            let mut path = Vec::new();
+            let mut cur = target;
+            while !self.nodes.contains_key(&cur) {
+                path.push(cur.clone());
+                match came_from.get(&cur) {
+                    Some(prev) => cur = prev.clone(),
+                    None => break,
+                }
+            }
+            if !self.nodes.contains_key(&cur) {
+                continue;
+            }
+            for child in path.into_iter().rev() {
+                self.place(&cur, std::slice::from_ref(&child), 0, &[]);
+                if let Some(p) = self.nodes.get_mut(&cur) {
+                    p.expanded = true;
+                }
+                cur = child;
+            }
+        }
+        // Edges of the picked relations between shown nodes are drawn even when
+        // neither end is expanded.
+        for e in &g.graph.edges {
+            if self.relation_passes(&e.relation)
+                && relevant.contains(&e.source)
+                && relevant.contains(&e.target)
+                && self.nodes.contains_key(&e.source)
+                && self.nodes.contains_key(&e.target)
+            {
+                self.extra.insert(e.id.clone());
+            }
+        }
+        complete
+    }
+
+    /// Node types and relations of the graph with their counts.
+    pub fn filter_entries(&self) -> Vec<(Filter, usize)> {
+        let Some(g) = &self.graph else { return Vec::new() };
+        let mut counts: BTreeMap<Filter, usize> = BTreeMap::new();
+        for n in &g.graph.nodes {
+            *counts.entry(Filter::Kind(n.kind.clone())).or_default() += 1;
+        }
+        for e in &g.graph.edges {
+            *counts.entry(Filter::Relation(e.relation.clone())).or_default() += 1;
+        }
+        counts.into_iter().collect()
+    }
+
+    /// Picks or unpicks a node type or relation: only matching nodes are shown, the
+    /// hidden ones revealed. Visible nodes keep their places. Returns false when the
+    /// reveal stopped at [`REVEAL_MAX`].
+    pub fn toggle_filter(&mut self, f: Filter) -> bool {
+        if !self.filters.remove(&f) {
+            self.filters.insert(f);
+        }
+        self.relevant = self.find_relevant();
+        let complete = self.reveal_relevant();
+        self.more.clear();
+        self.groups.clear();
+        let expanded: Vec<String> = self
+            .order
+            .iter()
+            .filter(|id| self.nodes[*id].expanded && self.shown(id))
+            .cloned()
+            .collect();
+        for id in expanded {
+            self.place_markers(&id);
+        }
+        let g = self.graph.clone();
+        let valid = match &self.sel {
+            Some(Sel::Node(id)) => self.shown(id),
+            Some(Sel::More(id)) => self.more.contains_key(id),
+            Some(Sel::Group(id, label)) => self.groups.contains_key(&(id.clone(), label.clone())),
+            Some(Sel::Edge(id)) => g.as_ref().and_then(|g| g.edge(id)).is_some_and(|e| self.edge_drawn(e)),
+            None => true,
+        };
+        if !valid {
+            let first = self.order.iter().find(|id| self.shown(id)).cloned();
+            self.sel = first.map(Sel::Node);
+        }
+        self.reveal = Some(Vec::new());
+        complete
+    }
+
+    /// Is this edge drawn: both ends visible and shown, one of them expanded (or lineage)?
     pub fn edge_drawn(&self, e: &Edge) -> bool {
+        if !self.shown(&e.source) || !self.shown(&e.target) || !self.relation_passes(&e.relation) {
+            return false;
+        }
         match (self.nodes.get(&e.source), self.nodes.get(&e.target)) {
             (Some(s), Some(t)) => s.expanded || t.expanded || self.extra.contains(&e.id),
             _ => false,
@@ -250,9 +446,8 @@ impl Explorer {
 
     /// Neighbors of `id` that are not visible, in display order, each once.
     pub fn hidden(&self, id: &str) -> Vec<String> {
-        let Some(g) = &self.graph else { return Vec::new() };
         let mut out: Vec<String> = Vec::new();
-        for nb in g.neighbors(id) {
+        for nb in self.links(id) {
             if !self.nodes.contains_key(&nb.node.id) && !out.contains(&nb.node.id) {
                 out.push(nb.node.id.clone());
             }
@@ -262,11 +457,12 @@ impl Explorer {
 
     /// Would expanding `id` show anything: a hidden neighbor or an edge not drawn?
     pub fn expandable(&self, id: &str) -> bool {
-        let (Some(g), Some(p)) = (&self.graph, self.nodes.get(id)) else {
+        let Some(p) = self.nodes.get(id) else {
             return false;
         };
         !p.expanded
-            && g.neighbors(id)
+            && self
+                .links(id)
                 .iter()
                 .any(|nb| !self.nodes.contains_key(&nb.node.id) || !self.edge_drawn(nb.edge))
     }
@@ -280,20 +476,72 @@ impl Explorer {
         let was = p.expanded;
         p.expanded = true;
         self.more.remove(id);
-        let kids = self.hidden(id);
-        let page: Vec<String> = kids.iter().take(PAGE).cloned().collect();
-        let rest = kids.len() - page.len();
-        self.place(id, &page, rest);
+        self.groups.retain(|(p, _), _| p != id);
+        let (loose, groups) = self.split(id);
+        let page: Vec<String> = loose.iter().take(PAGE).cloned().collect();
+        let rest = loose.len() - page.len();
+        self.place(id, &page, rest, &groups);
         self.reveal = Some(page.clone());
-        !was || !page.is_empty()
+        !was || !page.is_empty() || !groups.is_empty()
+    }
+
+    /// Relation of `kid` as read from `id` (the first one when there are several).
+    fn relation_to(&self, id: &str, kid: &str) -> Option<String> {
+        let g = self.graph.as_ref()?;
+        self.links(id)
+            .into_iter()
+            .find(|nb| nb.node.id == kid)
+            .map(|nb| g.relation_label(nb.edge, nb.outgoing))
+    }
+
+    /// Hidden neighbors of `id` split into loose ones and groups (relation label,
+    /// count) of relations with at least [`GROUP_MIN`] of them, when there are more
+    /// hidden neighbors than that.
+    fn split(&self, id: &str) -> (Vec<String>, Vec<(String, usize)>) {
+        let kids = self.hidden(id);
+        if kids.len() <= GROUP_MIN {
+            return (kids, Vec::new());
+        }
+        let labels: Vec<Option<String>> = kids.iter().map(|k| self.relation_to(id, k)).collect();
+        let mut counts: Vec<(String, usize)> = Vec::new();
+        for l in labels.iter().flatten() {
+            match counts.iter_mut().find(|(c, _)| c == l) {
+                Some((_, n)) => *n += 1,
+                None => counts.push((l.clone(), 1)),
+            }
+        }
+        counts.retain(|(_, n)| *n >= GROUP_MIN);
+        let grouped = |l: &Option<String>| l.as_ref().is_some_and(|l| counts.iter().any(|(c, _)| c == l));
+        let loose = kids
+            .into_iter()
+            .zip(&labels)
+            .filter(|(_, l)| !grouped(l))
+            .map(|(k, _)| k)
+            .collect();
+        (loose, counts)
+    }
+
+    /// Opens a group marker: all its neighbors appear below the node.
+    pub fn open_group(&mut self, id: &str, label: &str) {
+        self.groups.remove(&(id.to_string(), label.to_string()));
+        let kids: Vec<String> = self
+            .hidden(id)
+            .into_iter()
+            .filter(|k| self.relation_to(id, k).as_deref() == Some(label))
+            .collect();
+        self.place(id, &kids, 0, &[]);
+        if let Some(first) = kids.first() {
+            self.sel = Some(Sel::Node(first.clone()));
+        }
+        self.reveal = Some(kids);
     }
 
     /// "+N more": the next page of the node's neighbors, in rows below the others.
     pub fn show_more(&mut self, id: &str) {
         self.more.remove(id);
-        let kids = self.hidden(id);
-        let page: Vec<String> = kids.iter().take(PAGE).cloned().collect();
-        self.place(id, &page, kids.len() - page.len());
+        let (loose, _) = self.split(id);
+        let page: Vec<String> = loose.iter().take(PAGE).cloned().collect();
+        self.place(id, &page, loose.len() - page.len(), &[]);
         if let Some(first) = page.first() {
             self.sel = Some(Sel::Node(first.clone()));
         }
@@ -307,6 +555,7 @@ impl Explorer {
         let Some(p) = self.nodes.get_mut(id) else { return };
         p.expanded = false;
         self.more.remove(id);
+        self.groups.retain(|(p, _), _| p != id);
         let mut hide = self.descendants(id);
         loop {
             let keep = self.order.iter().filter(|h| hide.contains(*h)).find_map(|h| {
@@ -333,13 +582,14 @@ impl Explorer {
             }
             self.more.remove(h);
         }
+        self.groups.retain(|(p, _), _| !hide.contains(p));
         self.order.retain(|o| !hide.contains(o));
         self.extra.retain(|e| {
             g.edge(e)
                 .is_some_and(|e| !hide.contains(&e.source) && !hide.contains(&e.target))
         });
         let lost = match &self.sel {
-            Some(Sel::Node(n)) | Some(Sel::More(n)) => !self.nodes.contains_key(n),
+            Some(Sel::Node(n)) | Some(Sel::More(n)) | Some(Sel::Group(n, _)) => !self.nodes.contains_key(n),
             Some(Sel::Edge(e)) => g.edge(e).is_none_or(|e| !self.edge_drawn(e)),
             None => false,
         };
@@ -385,7 +635,7 @@ impl Explorer {
                     new.push(nb.node.id.clone());
                 }
             }
-            self.place(&id, &new, 0);
+            self.place(&id, &new, 0, &[]);
             for nb in links {
                 self.extra.insert(nb.edge.id.clone());
                 if seen.insert(nb.node.id.clone()) {
@@ -407,6 +657,7 @@ impl Explorer {
             .values()
             .map(|p| IRect::new(p.x, p.y, p.w, NODE_H))
             .chain(self.more.values().map(|m| IRect::new(m.x, m.y, m.w, NODE_H)))
+            .chain(self.groups.values().map(|m| IRect::new(m.x, m.y, m.w, NODE_H)))
     }
 
     fn free(&self, r: &IRect) -> bool {
@@ -431,9 +682,9 @@ impl Explorer {
         (x, bottom + V_GAP + 1)
     }
 
-    /// Places `kids` (not visible yet) in rows centered under `parent`; `more`
-    /// hidden neighbors get a "+N more" marker at the end.
-    fn place(&mut self, parent: &str, kids: &[String], more: usize) {
+    /// Places `kids` (not visible yet) in rows centered under `parent`, then a marker
+    /// per group of `groups`; `more` hidden neighbors get a "+N more" marker at the end.
+    fn place(&mut self, parent: &str, kids: &[String], more: usize, groups: &[(String, usize)]) {
         let Some(g) = self.graph.clone() else { return };
         let Some(p) = self.nodes.get(parent).cloned() else {
             return;
@@ -441,7 +692,7 @@ impl Explorer {
         let widths: Vec<i32> = kids.iter().map(|k| g.node(k).map_or(10, node_width)).collect();
         // Places they had before, when all of them are still free.
         let before: Option<Vec<(i32, i32)>> = kids.iter().map(|k| self.remembered.get(k).copied()).collect();
-        if let Some(spots) = before.filter(|_| more == 0 && !kids.is_empty()) {
+        if let Some(spots) = before.filter(|_| more == 0 && groups.is_empty() && !kids.is_empty()) {
             let rects: Vec<IRect> = spots
                 .iter()
                 .zip(&widths)
@@ -459,23 +710,27 @@ impl Explorer {
             }
         }
         // Slot of a kid: its box, or its relation label when that is wider.
-        let mut slots: Vec<(Option<&String>, i32, i32)> = kids
+        let mut slots: Vec<(Slot, i32, i32)> = kids
             .iter()
             .zip(&widths)
             .map(|(k, &w)| {
                 let label = link_label(&g, parent, k).width() as i32;
-                (Some(k), w, w.max(label + 2))
+                (Slot::Node(k), w, w.max(label + 2))
             })
             .collect();
+        for (label, count) in groups {
+            let w = text::relation_group(*count).width() as i32 + 4;
+            slots.push((Slot::Group(label, *count), w, w.max(label.width() as i32 + 2)));
+        }
         if more > 0 {
             let w = text::more_neighbors(more).width() as i32 + 4;
-            slots.push((None, w, w));
+            slots.push((Slot::More, w, w));
         }
         if slots.is_empty() {
             return;
         }
         let max_row = ((f64::from(self.area.width) / self.zoom) as i32).max(60);
-        let mut rows: Vec<Vec<(Option<&String>, i32, i32)>> = vec![Vec::new()];
+        let mut rows: Vec<Vec<(Slot, i32, i32)>> = vec![Vec::new()];
         let mut width = 0;
         for s in slots {
             if rows.last().is_some_and(|r| !r.is_empty()) && width + H_GAP + s.2 > max_row {
@@ -502,18 +757,14 @@ impl Explorer {
                     cx += TRUNK_GAP + H_GAP;
                 }
                 let nx = cx + (slot - w) / 2;
+                let marker = |count| More { x: nx, y: yy, w, count };
                 match id {
-                    Some(id) => self.insert(id, nx, yy, w, parent),
-                    None => {
-                        self.more.insert(
-                            parent.to_string(),
-                            More {
-                                x: nx,
-                                y: yy,
-                                w,
-                                count: more,
-                            },
-                        );
+                    Slot::Node(id) => self.insert(id, nx, yy, w, parent),
+                    Slot::Group(label, count) => {
+                        self.groups.insert((parent.to_string(), label.clone()), marker(count));
+                    }
+                    Slot::More => {
+                        self.more.insert(parent.to_string(), marker(more));
                     }
                 }
                 cx += slot + H_GAP;
@@ -522,14 +773,25 @@ impl Explorer {
         }
     }
 
-    /// "+N more" alone (after a reload): below the node's lowest revealed row.
-    fn place_more(&mut self, parent: &str, count: usize) {
+    /// Markers alone (after a reload or a filter change): groups and "+N more" of the
+    /// node's hidden neighbors, below its lowest revealed row.
+    fn place_markers(&mut self, parent: &str) {
         let Some(p) = self.nodes.get(parent).cloned() else {
             return;
         };
-        let w = text::more_neighbors(count).width() as i32 + 4;
-        let (x, y) = self.find_spot(p.x + p.w / 2 - w / 2, p.y + NODE_H + V_GAP, w);
-        self.more.insert(parent.to_string(), More { x, y, w, count });
+        let (loose, groups) = self.split(parent);
+        let spot = |ex: &Self, w: i32| ex.find_spot(p.x + p.w / 2 - w / 2, p.y + NODE_H + V_GAP, w);
+        for (label, count) in groups {
+            let w = text::relation_group(count).width() as i32 + 4;
+            let (x, y) = spot(self, w);
+            self.groups.insert((parent.to_string(), label), More { x, y, w, count });
+        }
+        if !loose.is_empty() {
+            let count = loose.len();
+            let w = text::more_neighbors(count).width() as i32 + 4;
+            let (x, y) = spot(self, w);
+            self.more.insert(parent.to_string(), More { x, y, w, count });
+        }
     }
 
     fn insert(&mut self, id: &str, x: i32, y: i32, w: i32, parent: &str) {
@@ -572,17 +834,6 @@ impl Explorer {
         }
     }
 
-    /// ↓: expands a node with something to show, else moves down.
-    pub fn down(&mut self) {
-        match self.sel.clone() {
-            Some(Sel::Node(id)) if self.expandable(&id) => {
-                self.expand(&id);
-            }
-            Some(Sel::More(id)) => self.show_more(&id),
-            _ => self.go(Dir::Down),
-        }
-    }
-
     /// Space: expands or collapses the selected node.
     pub fn toggle(&mut self) {
         match self.sel.clone() {
@@ -591,6 +842,7 @@ impl Explorer {
                 self.expand(&id);
             }
             Some(Sel::More(id)) => self.show_more(&id),
+            Some(Sel::Group(id, label)) => self.open_group(&id, &label),
             _ => {}
         }
     }
@@ -600,7 +852,7 @@ impl Explorer {
         let target = match self.sel.clone() {
             Some(Sel::Node(id)) if self.nodes.get(&id).is_some_and(|p| p.expanded) => Some(id),
             Some(Sel::Node(id)) => self.nodes.get(&id).and_then(|p| p.parent.clone()),
-            Some(Sel::More(id)) => Some(id),
+            Some(Sel::More(id)) | Some(Sel::Group(id, _)) => Some(id),
             Some(Sel::Edge(id)) => self.frame.edges.iter().find(|e| e.id == id).map(|e| e.from.clone()),
             None => None,
         };
@@ -621,7 +873,7 @@ impl Explorer {
                 .iter()
                 .find(|e| e.id == id)
                 .map(|e| Sel::Node(e.from.clone())),
-            Some(Sel::More(id)) => Some(Sel::Node(id)),
+            Some(Sel::More(id)) | Some(Sel::Group(id, _)) => Some(Sel::Node(id)),
             None => None,
         };
         match next {

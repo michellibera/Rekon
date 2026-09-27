@@ -93,18 +93,22 @@ How the graph is built:
 | Key (ontology view) | Action |
 | --- | --- |
 | arrows, hjkl | move to the nearest element in that direction (nodes and relation labels) |
-| ↓ on a ▸ node | expand: its neighbors appear below it, nothing else moves |
-| Space / Backspace | expand or collapse / collapse the node (or the one above it) |
+| Space / Backspace | expand (neighbors appear below it, nothing else moves) or collapse / collapse the node (or the one above it) |
 | Enter | evidence of the node or relation in the code panel; again: the next one |
 | [ / ] | previous / next evidence |
 | Esc | the node one level up |
 | + / - / 0 | zoom in / out / 100% |
 | c / Home | center on the selection / go to the root |
+| f | filters: only nodes of the picked types, joined by the picked relations; hidden ones are revealed (none picked: everything) |
 | L | reveal the data lineage (`derivedFrom`) of the selection |
 | R / r | analyze changed files / the selection's files again |
 
 Mouse: a click selects a node or a relation, a double click expands, dragging moves a node or
 the view, the wheel zooms.
+
+Focus: the selection, its neighbors and their relations stay bright, the rest is grayed out.
+Groups: when a node has more than 5 hidden neighbors, those joined by one relation (5 or more)
+wait behind a marker with their count; the relation is on the line to it. Space or Enter opens it.
 
 The ontology is data. `.rekon/ontology/schema.json` adds or overrides node types and relations
 (same format as `crates/rekon-core/prompts/ontology.json`, e.g. a `DataEntityField` type with a

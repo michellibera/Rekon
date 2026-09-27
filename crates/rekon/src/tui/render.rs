@@ -8,7 +8,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use rekon_core::text;
 
 use super::app::{App, Focus, Popup, View};
-use super::graph;
+use super::graph::{self, Filter};
 use super::rows::{self, DIM, Row, RowRef};
 
 const TREE_PERCENT: u16 = 45;
@@ -98,6 +98,38 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             }
             lines.extend(text.lines().map(|l| Line::from(l.to_string())));
             popup(f, text::OVERVIEW_TITLE, lines, scroll);
+        }
+        Some(Popup::Filter(cursor)) => {
+            let mut lines = Vec::new();
+            let mut section = "";
+            let mut cursor_line = 0;
+            for (i, (f, count)) in app.explorer.filter_entries().iter().enumerate() {
+                let (title, name) = match f {
+                    Filter::Kind(k) => (text::FILTER_KINDS, k),
+                    Filter::Relation(r) => (text::FILTER_RELATIONS, r),
+                };
+                if title != section {
+                    if !section.is_empty() {
+                        lines.push(Line::default());
+                    }
+                    lines.push(Line::from(Span::styled(
+                        title,
+                        Style::new().add_modifier(Modifier::BOLD),
+                    )));
+                    section = title;
+                }
+                if i == cursor {
+                    cursor_line = lines.len();
+                }
+                let on = app.explorer.filters.contains(f);
+                let row = format!("{} {name}  ({count})", if on { "[x]" } else { "[ ]" });
+                let style = if i == cursor { SEL_FOCUSED } else { Style::new() };
+                lines.push(Line::from(Span::styled(row, style)));
+            }
+            // Inner height of the popup: the cursor stays on screen.
+            let h = usize::from(f.area().height * 4 / 5).saturating_sub(2).max(1);
+            let scroll = (cursor_line + 1).saturating_sub(h) as u16;
+            popup(f, text::FILTER_TITLE, lines, scroll);
         }
         Some(Popup::Help) => {
             let key = |(k, d): &(&str, &'static str)| {

@@ -305,7 +305,7 @@ pub fn build(ex: &Explorer, g: &GraphIndex) -> Frame {
         ..Default::default()
     };
     let mut rects: HashMap<&str, IRect> = HashMap::new();
-    for id in &ex.order {
+    for id in ex.order.iter().filter(|id| ex.shown(id)) {
         let p = &ex.nodes[id];
         let (w, h) = size(p.w);
         let r = IRect::new(sx(p.x), sy(p.y), w, h);
@@ -316,8 +316,9 @@ pub fn build(ex: &Explorer, g: &GraphIndex) -> Frame {
             compact,
         });
     }
-    let mut markers: Vec<(&String, IRect)> = Vec::new();
-    let mut more: Vec<(&String, &super::More)> = ex.more.iter().collect();
+    // Lines to markers: (line id, node, marker box, relation label).
+    let mut markers: Vec<(String, &String, IRect, Option<&String>)> = Vec::new();
+    let mut more: Vec<(&String, &super::More)> = ex.more.iter().filter(|(p, _)| ex.shown(p)).collect();
     more.sort_by(|a, b| a.0.cmp(b.0));
     for (parent, m) in more {
         let (w, h) = size(m.w);
@@ -327,7 +328,17 @@ pub fn build(ex: &Explorer, g: &GraphIndex) -> Frame {
             rect: r,
             compact,
         });
-        markers.push((parent, r));
+        markers.push((format!("more:{parent}"), parent, r, None));
+    }
+    for ((parent, label), m) in ex.groups.iter().filter(|((p, _), _)| ex.shown(p)) {
+        let (w, h) = size(m.w);
+        let r = IRect::new(sx(m.x), sy(m.y), w, h);
+        frame.nodes.push(NodeBox {
+            sel: Sel::Group(parent.clone(), label.clone()),
+            rect: r,
+            compact,
+        });
+        markers.push((format!("group:{parent}:{label}"), parent, r, Some(label)));
     }
 
     // Edges between visible nodes with an expanded end, grouped by the pair they join.
@@ -395,17 +406,32 @@ pub fn build(ex: &Explorer, g: &GraphIndex) -> Frame {
             });
         }
     }
-    for (parent, m) in markers {
+    for (id, parent, m, relation) in markers {
         let Some(&a) = rects.get(parent.as_str()) else { continue };
         let Some(r) = route(a, m) else { continue };
+        let label = relation.and_then(|text| {
+            let width = text.width() as i32;
+            let spot = r
+                .spots
+                .iter()
+                .filter(|s| s.2 || !compact)
+                .map(|&(cx, y, _)| IRect::new(cx - width / 2, y, width, 1))
+                .find(|l| taken.iter().all(|t| !t.intersects(&l.grow(1, 0))))?;
+            taken.push(spot);
+            Some(Label {
+                x: spot.x,
+                y: spot.y,
+                text: text.clone(),
+            })
+        });
         let middle = cells(&r.points)[cells(&r.points).len() / 2];
         frame.edges.push(EdgePath {
-            id: format!("more:{parent}"),
+            id,
             from: parent.clone(),
             points: r.points,
             arrow: Some(r.arrow),
             exit: Some(r.exit),
-            label: None,
+            label,
             anchor: middle,
             more: true,
             cross: false,
