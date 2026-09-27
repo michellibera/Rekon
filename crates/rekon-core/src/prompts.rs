@@ -69,6 +69,7 @@ pub fn schema(kind: TaskKind) -> Value {
                 "required": ["start", "end", "summary"],
                 "properties": { "start": { "type": "integer" }, "end": { "type": "integer" },
                                 "summary": { "type": "string" } } } } } }),
+        TaskKind::Ontology => crate::ontology::extract::answer_schema(&crate::ontology::schema::Schema::builtin()),
     }
 }
 
@@ -77,6 +78,7 @@ fn request(config: &Config, system: &str, kind: TaskKind, task: String, input: S
         TaskKind::Overview => &config.models.overview,
         TaskKind::Files | TaskKind::Dirs => &config.models.tree,
         TaskKind::Segment => &config.models.blocks,
+        TaskKind::Ontology => &config.models.ontology,
     };
     LlmRequest {
         kind,
@@ -392,7 +394,8 @@ mod tests {
     fn system_prompt_contains_language_and_style() {
         let s = system("pl", "# Style\n- short");
         assert!(s.contains("Language of the descriptions: pl."));
-        assert!(s.ends_with("- short\n") || s.ends_with("- short"));
+        // Templates have CRLF endings in a Windows checkout with core.autocrlf.
+        assert!(s.trim_end().ends_with("- short"));
     }
 
     #[test]

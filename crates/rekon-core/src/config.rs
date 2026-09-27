@@ -12,6 +12,7 @@ pub struct Models {
     pub overview: String,
     pub tree: String,
     pub blocks: String,
+    pub ontology: String,
 }
 
 impl Default for Models {
@@ -20,6 +21,7 @@ impl Default for Models {
             overview: "sonnet".into(),
             tree: "haiku".into(),
             blocks: "sonnet".into(),
+            ontology: "sonnet".into(),
         }
     }
 }
@@ -29,6 +31,41 @@ impl Default for Models {
 pub struct OpenCode {
     pub model: Option<String>,
     pub attach: Option<String>,
+}
+
+/// Which files are mapped onto the ontology and how they are sent to the model.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(default)]
+pub struct Ontology {
+    /// Globs of files to analyze (full path or file name).
+    pub include: Vec<String>,
+    /// Globs of files left out (tests by default).
+    pub exclude: Vec<String>,
+    /// Lines of code per model call; longer files are split.
+    pub batch_lines: u32,
+    pub batch_max_files: usize,
+}
+
+impl Default for Ontology {
+    fn default() -> Self {
+        let list = |items: &str| items.split_whitespace().map(str::to_string).collect();
+        Self {
+            include: list(concat!(
+                "*.rs *.ts *.tsx *.js *.jsx *.mjs *.cjs *.py *.go *.java *.kt *.kts *.scala *.cs *.fs *.vb *.c ",
+                "*.h *.cc *.cpp *.hpp *.swift *.rb *.php *.ex *.exs *.erl *.clj *.hs *.lua *.dart *.vue *.svelte ",
+                "*.sql *.proto *.graphql *.gql *.tf *.hcl *.sh *.ps1 *.bat *.cmd Dockerfile *.dockerfile *.yaml ",
+                "*.yml *.toml *.csproj *.gradle pom.xml Makefile CMakeLists.txt package.json appsettings*.json ",
+                "openapi*.json swagger*.json",
+            )),
+            exclude: list(concat!(
+                "**/tests/** **/test/** **/__tests__/** **/testdata/** tests.rs *_tests.rs *_test.rs *_test.go ",
+                "*_test.py test_*.py *.test.* *.spec.* *Tests.cs *Test.java *.min.js *.lock **/node_modules/** ",
+                "**/vendor/**",
+            )),
+            batch_lines: 300,
+            batch_max_files: 8,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -50,6 +87,7 @@ pub struct Config {
     pub exclude: Vec<String>,
     pub editor_cmd: Option<String>,
     pub opencode: OpenCode,
+    pub ontology: Ontology,
 }
 
 impl Default for Config {
@@ -83,6 +121,7 @@ impl Default for Config {
             .collect(),
             editor_cmd: None,
             opencode: OpenCode::default(),
+            ontology: Ontology::default(),
         }
     }
 }
@@ -129,5 +168,7 @@ mod tests {
         assert_eq!(c.models.tree, "x");
         assert_eq!(c.models.blocks, "sonnet");
         assert_eq!(c.max_segment_lines, 1500);
+        assert_eq!(c.models.ontology, "sonnet");
+        assert_eq!(c.ontology.batch_lines, 300);
     }
 }

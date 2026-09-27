@@ -11,6 +11,7 @@ pub mod hash;
 pub mod init;
 pub mod jobs;
 pub mod model;
+pub mod ontology;
 pub mod prompts;
 pub mod scan;
 pub mod segment;

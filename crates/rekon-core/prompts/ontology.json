@@ -1,0 +1,189 @@
+{
+  "version": 1,
+  "types": [
+    {
+      "id": "Actor",
+      "color": "#e0e0e0",
+      "description": "Person or external agent that uses the system: end user, operator, a program or AI agent acting as a client"
+    },
+    {
+      "id": "System",
+      "color": "#87afff",
+      "description": "The analyzed system as a whole, or an external system it talks to (service, platform, application)"
+    },
+    {
+      "id": "Component",
+      "color": "#5fafd7",
+      "code": true,
+      "description": "Part of the code with a clear responsibility: module, service, class, struct with behavior, package"
+    },
+    {
+      "id": "Interface",
+      "color": "#5fd7d7",
+      "code": true,
+      "description": "Entry point or contract: CLI command, HTTP endpoint, public trait or interface, hook, handler signature, key binding"
+    },
+    {
+      "id": "Process",
+      "color": "#87d787",
+      "code": true,
+      "description": "Named operation or workflow the code performs: use case, pipeline, algorithm, background job (usually a function)"
+    },
+    {
+      "id": "DataEntity",
+      "color": "#d7d75f",
+      "code": true,
+      "description": "Data structure the system works with: struct, record, DTO, message payload, configuration object, table row"
+    },
+    {
+      "id": "DataTransformation",
+      "color": "#d7af5f",
+      "code": true,
+      "description": "Step that turns data into other data: parsing, mapping, serialization, validation, building a request"
+    },
+    {
+      "id": "DataStore",
+      "color": "#d787d7",
+      "description": "Place where data is kept: database, table, file, directory, cache, queue"
+    },
+    {
+      "id": "Event",
+      "color": "#ff8787",
+      "code": true,
+      "description": "Message or signal that is emitted and handled: domain event, callback, channel message, hook event, UI event"
+    },
+    {
+      "id": "Dependency",
+      "color": "#a8a8a8",
+      "description": "External library, tool, service or API the system relies on"
+    },
+    {
+      "id": "Observation",
+      "color": "#afd7af",
+      "description": "Way to observe behavior: log line, metric, trace, alert, progress or status output"
+    },
+    {
+      "id": "FailureMode",
+      "color": "#ff5f5f",
+      "description": "Way things can go wrong: error condition, timeout, invalid input, missing resource, inconsistency"
+    },
+    {
+      "id": "SourceCode",
+      "color": "#8a8a8a",
+      "extract": false,
+      "description": "Source file; added by rekon from the evidence of other elements"
+    },
+    {
+      "id": "Owner",
+      "color": "#d7afff",
+      "description": "Person or team responsible for a part of the system (CODEOWNERS, manifest authors)"
+    }
+  ],
+  "relations": [
+    {
+      "id": "contains",
+      "inverse": "partOf",
+      "description": "System or Component -> element it structurally contains (sub-component, module)"
+    },
+    {
+      "id": "invokes",
+      "inverse": "invokedBy",
+      "description": "Actor or Component -> Interface or Process it starts"
+    },
+    {
+      "id": "calls",
+      "inverse": "calledBy",
+      "description": "Component or Process -> Component, Interface, Process or Dependency it calls"
+    },
+    {
+      "id": "executes",
+      "inverse": "executedBy",
+      "description": "Component -> Process it runs"
+    },
+    {
+      "id": "handledBy",
+      "inverse": "handles",
+      "description": "Interface or Event -> Component or Process that handles it"
+    },
+    {
+      "id": "produces",
+      "inverse": "producedBy",
+      "description": "Component or Process -> DataEntity or Observation it creates"
+    },
+    {
+      "id": "consumes",
+      "inverse": "consumedBy",
+      "description": "Component or Process -> Event or DataEntity it takes as input"
+    },
+    {
+      "id": "reads",
+      "inverse": "readBy",
+      "description": "Component or Process -> DataEntity or DataStore it reads"
+    },
+    {
+      "id": "writes",
+      "inverse": "writtenBy",
+      "description": "Component or Process -> DataEntity or DataStore it writes"
+    },
+    {
+      "id": "transforms",
+      "inverse": "transformedBy",
+      "description": "DataTransformation -> DataEntity it takes and turns into another"
+    },
+    {
+      "id": "derivedFrom",
+      "inverse": "derives",
+      "description": "DataEntity -> DataEntity it is built from (data lineage)"
+    },
+    {
+      "id": "storedIn",
+      "inverse": "stores",
+      "description": "DataEntity -> DataStore where it is kept"
+    },
+    {
+      "id": "emits",
+      "inverse": "emittedBy",
+      "description": "Component or Process -> Event it sends"
+    },
+    {
+      "id": "triggers",
+      "inverse": "triggeredBy",
+      "description": "Event, Interface or Process -> Process it starts"
+    },
+    {
+      "id": "dependsOn",
+      "inverse": "requiredBy",
+      "description": "System or Component -> Component or Dependency it needs"
+    },
+    {
+      "id": "implementedBy",
+      "inverse": "implements",
+      "description": "Interface or Process -> Component that implements it (links to source files are added by rekon)"
+    },
+    {
+      "id": "observableBy",
+      "inverse": "observes",
+      "description": "Process, Component or FailureMode -> Observation that makes it visible"
+    },
+    {
+      "id": "mayFailWith",
+      "inverse": "mayOccurIn",
+      "description": "Component or Process -> FailureMode that can happen in it"
+    },
+    {
+      "id": "causes",
+      "inverse": "causedBy",
+      "description": "FailureMode or Event -> FailureMode or Event it leads to"
+    },
+    {
+      "id": "affects",
+      "inverse": "affectedBy",
+      "description": "FailureMode -> Component, Process or DataEntity it harms"
+    },
+    {
+      "id": "ownedBy",
+      "inverse": "owns",
+      "description": "Element -> Owner responsible for it"
+    }
+  ]
+}

@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use rekon_core::init::{self, Options, Progress};
 use rekon_core::model::Author;
+use rekon_core::ontology;
 use rekon_core::scan::{Tree, normalize_prefix};
 use rekon_core::{Ctx, apply, check, context, segment, setup, view};
 
@@ -79,6 +80,12 @@ enum Cmd {
         #[arg(long)]
         hook: bool,
     },
+    /// Map the repository onto the ontology: a graph of components, interfaces, data and events
+    /// with the code that proves every element and relation
+    Ontology {
+        #[command(subcommand)]
+        command: OntologyCmd,
+    },
     /// Install the rekon-init skill and the hooks in ~/.claude (once per machine)
     Setup {
         /// Only show the changes
@@ -87,6 +94,28 @@ enum Cmd {
         /// Instead: add the rekon rule to OpenCode's global AGENTS.md
         #[arg(long)]
         opencode: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum OntologyCmd {
+    /// Analyze changed files with the model and rebuild .rekon/ontology/graph.json
+    Index {
+        /// Only these files
+        paths: Vec<String>,
+        /// Analyze the files again even when unchanged
+        #[arg(long)]
+        force: bool,
+        /// Only list the model requests it would make
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Print a node with its evidence and relations; without ID the root and counts per type
+    Show {
+        /// Node id or name, e.g. component:store or Store
+        id: Option<String>,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -242,6 +271,46 @@ fn run(cli: Cli) -> Result<u8> {
             print!("{}", context::render(&ctx, &setup::exe_path()?)?);
             Ok(0)
         }
+        Cmd::Ontology {
+            command: OntologyCmd::Index { paths, force, dry_run },
+        } => {
+            let root = rekon_core::scan::find_root(&cwd)?;
+            init::prepare(&root)?;
+            let ctx = Ctx::at_root(&root)?;
+            let paths = (!paths.is_empty()).then(|| paths.iter().map(|p| rel_prefix(&ctx, &cwd, Some(p))).collect());
+            cmd_ontology(&ctx, ontology::index::Options { force, paths, dry_run })
+        }
+        Cmd::Ontology {
+            command: OntologyCmd::Show { id, json },
+        } => {
+            let ctx = open_with_map(&cwd)?;
+            let Some(g) = ontology::graph::load(ctx.store.dir())? else {
+                return Err(Usage(rekon_core::text::NO_GRAPH.into()).into());
+            };
+            let Some(query) = id else {
+                print!("{}", ontology::view::summary_text(&g));
+                return Ok(0);
+            };
+            let found = g.find(&query);
+            match found.as_slice() {
+                [] => Err(Usage(format!("no node matches {query}")).into()),
+                [n] if json => {
+                    println!("{}", serde_json::to_string_pretty(&ontology::view::node_json(&g, n))?);
+                    Ok(0)
+                }
+                [n] => {
+                    print!("{}", ontology::view::node_text(&g, n));
+                    Ok(0)
+                }
+                many => {
+                    eprintln!("{} nodes match {query}:", many.len());
+                    for n in many {
+                        println!("{} · {} ({})", n.kind, n.name, n.id);
+                    }
+                    Ok(USAGE)
+                }
+            }
+        }
         Cmd::Setup { dry_run, opencode } => {
             let dir = setup::claude_dir()?;
             let changes = if opencode {
@@ -344,6 +413,45 @@ fn cmd_init(ctx: &Ctx, prefix: &str, force: bool) -> Result<u8> {
         report.removed,
         report.cost
     );
+    if report.errors > 0 {
+        eprintln!("Details in {}", ctx.store.dir().join("rekon.log").display());
+    }
+    Ok(if report.errors > 0 { 1 } else { 0 })
+}
+
+fn cmd_ontology(ctx: &Ctx, opts: ontology::index::Options) -> Result<u8> {
+    let tty = std::io::stderr().is_terminal();
+    let print = |p: &ontology::index::Progress| {
+        let mut err = std::io::stderr().lock();
+        if tty {
+            let _ = write!(err, "\r\x1b[2K{}", p.line());
+        } else {
+            let _ = writeln!(err, "{}", p.line());
+        }
+        let _ = err.flush();
+    };
+    let report = ontology::index::run(ctx, &opts, &print)?;
+    if opts.dry_run {
+        for (i, request) in report.planned.iter().enumerate() {
+            println!("request {}: {}", i + 1, request.join(", "));
+        }
+        eprintln!(
+            "Would analyze {} of {} files in {} model requests ({} unchanged).",
+            report.analyzed,
+            report.files,
+            report.planned.len(),
+            report.reused
+        );
+        return Ok(0);
+    }
+    if tty {
+        eprintln!();
+    }
+    eprintln!(
+        "Ontology: {} files ({} analyzed, {} unchanged) · {} nodes · {} edges · errors: {} · cost ~${:.2}",
+        report.files, report.analyzed, report.reused, report.nodes, report.edges, report.errors, report.cost
+    );
+    eprintln!("Graph: {}", ontology::graph_path(ctx.store.dir()).display());
     if report.errors > 0 {
         eprintln!("Details in {}", ctx.store.dir().join("rekon.log").display());
     }

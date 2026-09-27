@@ -17,6 +17,7 @@ pub enum TaskKind {
     Files,
     Dirs,
     Segment,
+    Ontology,
 }
 
 impl TaskKind {
@@ -26,6 +27,7 @@ impl TaskKind {
             TaskKind::Files => "files",
             TaskKind::Dirs => "dirs",
             TaskKind::Segment => "segment",
+            TaskKind::Ontology => "ontology",
         }
     }
 }

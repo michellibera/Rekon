@@ -9,6 +9,7 @@ use anyhow::Result;
 use serde_json::json;
 
 use super::{Backend, LlmRequest, LlmResponse, TaskKind};
+use crate::ontology::extract::{KNOWN_MARKER, OUTLINE_MARKER, SYMBOLS_MARKER};
 use crate::prompts::{CODE_MARKER, DIR_MARKER, FILE_MARKER, parse_numbered_line};
 
 #[derive(Default)]
@@ -70,6 +71,7 @@ impl Backend for FakeBackend {
                 json!({ "dirs": dirs })
             }
             TaskKind::Segment => json!({ "blocks": split(&req.input) }),
+            TaskKind::Ontology => ontology(&req.input),
         };
         Ok(LlmResponse {
             json,
@@ -121,6 +123,123 @@ fn split(input: &str) -> Vec<serde_json::Value> {
             json!({"start": s, "end": e, "summary": format!("Opis testowy: linie {s}-{e}")})
         })
         .collect()
+}
+
+/// One file of an ontology request, as the fake reads it back.
+#[derive(Default)]
+struct OntologyFile {
+    path: String,
+    /// (start, end, kind, name) from the OUTLINE section.
+    items: Vec<(u32, u32, String, String)>,
+    code: Vec<(u32, String)>,
+}
+
+fn last_segment(name: &str) -> &str {
+    name.rsplit([':', '.']).find(|s| !s.is_empty()).unwrap_or(name)
+}
+
+/// For each file: a Component named after the file (`orders module`), a DataEntity
+/// per type and a Process per function of the outline (`reads`/`executes` from the
+/// Component), and `calls` edges to types of other files and known elements that
+/// the code mentions.
+fn ontology(input: &str) -> serde_json::Value {
+    let mut files: Vec<OntologyFile> = Vec::new();
+    let mut known: Vec<(String, String)> = Vec::new();
+    let mut section = "";
+    for line in input.lines() {
+        if line.starts_with(KNOWN_MARKER) || line.starts_with(SYMBOLS_MARKER) {
+            section = "known";
+        } else if let Some(rest) = line.strip_prefix(FILE_MARKER) {
+            files.push(OntologyFile {
+                path: rest.strip_suffix(" ---").unwrap_or(rest).to_string(),
+                ..Default::default()
+            });
+            section = "file";
+        } else if line == OUTLINE_MARKER {
+            section = "outline";
+        } else if line == CODE_MARKER {
+            section = "code";
+        } else if let Some(rest) = line.strip_prefix("- ").filter(|_| section == "known") {
+            // `{type or kind} {name} ({path})`
+            let rest = rest.rsplit_once(" (").map_or(rest, |(r, _)| r);
+            if let Some((label, name)) = rest.split_once(' ') {
+                let kind = if label.starts_with(char::is_uppercase) {
+                    label
+                } else {
+                    "Component"
+                };
+                known.push((kind.to_string(), name.to_string()));
+            }
+        } else if let Some(rest) = line.strip_prefix("- ").filter(|_| section == "outline") {
+            // `{start}-{end} {kind} {name}`
+            let mut words = rest.splitn(3, ' ');
+            let (Some(range), Some(kind), Some(name)) = (words.next(), words.next(), words.next()) else {
+                continue;
+            };
+            let Some((a, b)) = range.split_once('-') else { continue };
+            if let (Ok(a), Ok(b), Some(f)) = (a.parse(), b.parse(), files.last_mut()) {
+                f.items.push((a, b, kind.to_string(), name.to_string()));
+            }
+        } else if section == "code"
+            && let (Some((nr, text)), Some(f)) = (parse_numbered_line(line), files.last_mut())
+        {
+            f.code.push((nr, text.to_string()));
+        }
+    }
+    let mut nodes = Vec::new();
+    let mut edges = Vec::new();
+    let reference = |kind: &str, name: &str| json!({"type": kind, "name": name});
+    let evidence = |file: &str, a: u32, b: u32, symbol: Option<&str>| {
+        let mut e = json!({"file": file, "start": a, "end": b, "reason": "Opis testowy"});
+        if let Some(s) = symbol {
+            e["symbol"] = json!(s);
+        }
+        json!([e])
+    };
+    for f in &files {
+        let (Some(first), Some(last)) = (f.code.first(), f.code.last()) else {
+            continue;
+        };
+        let file = f.path.rsplit('/').next().unwrap_or(&f.path);
+        let module = format!("{} module", file.split('.').next().unwrap_or(file));
+        nodes.push(
+            json!({"type": "Component", "name": module, "description": description(&f.path),
+            "confidence": 0.9, "evidence": evidence(&f.path, first.0, last.0, None)}),
+        );
+        for (a, b, kind, name) in &f.items {
+            let (node_type, relation) = match kind.as_str() {
+                "struct" | "enum" | "class" | "interface" | "trait" | "record" | "type" | "union" => {
+                    ("DataEntity", "reads")
+                }
+                "fn" | "method" | "def" => ("Process", "executes"),
+                _ => continue,
+            };
+            let symbol = last_segment(name);
+            nodes.push(
+                json!({"type": node_type, "name": name, "description": description(name),
+                "confidence": 0.8, "evidence": evidence(&f.path, *a, *b, Some(symbol))}),
+            );
+            edges.push(json!({"source": reference("Component", &module), "relation": relation,
+                "target": reference(node_type, name), "confidence": 0.8,
+                "evidence": evidence(&f.path, *a, *a, Some(symbol))}));
+        }
+        let others = files.iter().filter(|g| g.path != f.path).flat_map(|g| {
+            g.items
+                .iter()
+                .filter(|it| matches!(it.2.as_str(), "struct" | "enum" | "class" | "interface" | "trait"))
+                .map(|it| ("DataEntity".to_string(), it.3.clone()))
+        });
+        let targets: Vec<(String, String)> = known.iter().cloned().chain(others).collect();
+        for (kind, name) in &targets {
+            let key = last_segment(name);
+            if let Some((nr, _)) = f.code.iter().find(|(_, text)| text.contains(key)) {
+                edges.push(json!({"source": reference("Component", &module), "relation": "calls",
+                    "target": reference(kind, name), "confidence": 0.7,
+                    "evidence": evidence(&f.path, *nr, *nr, Some(key))}));
+            }
+        }
+    }
+    json!({ "nodes": nodes, "edges": edges })
 }
 
 #[cfg(test)]

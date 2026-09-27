@@ -359,7 +359,8 @@ fn remove_if_exists(path: &Path) -> Result<()> {
     }
 }
 
-fn list_notes(base: &Path) -> Vec<String> {
+/// Relative paths (without `.json`) of the JSON files under `base`.
+pub(crate) fn list_notes(base: &Path) -> Vec<String> {
     let mut out = Vec::new();
     let mut stack = vec![base.to_path_buf()];
     while let Some(dir) = stack.pop() {

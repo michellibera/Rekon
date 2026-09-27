@@ -2,6 +2,9 @@
 
 mod app;
 mod editor;
+mod graph;
+#[cfg(test)]
+mod graph_tests;
 mod highlight;
 mod render;
 mod rows;

@@ -9,7 +9,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use wait_timeout::ChildExt;
 
-use super::{Backend, LlmRequest, LlmResponse};
+use super::{Backend, LlmRequest, LlmResponse, TaskKind};
 use crate::config::Config;
 use crate::text;
 
@@ -69,6 +69,11 @@ impl Backend for ClaudeBackend {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if req.kind == TaskKind::Ontology {
+            // Measured on one 114-line file: with thinking the answer took 8.7k output
+            // tokens with sonnet and 26k with haiku (250 s); without it 3.5k, same JSON.
+            cmd.env("MAX_THINKING_TOKENS", "0");
+        }
         let (status, stdout, stderr) = run_with_input(cmd, req.input.as_bytes(), self.timeout)?;
         parse_output(status, &stdout, &stderr)
     }
@@ -205,7 +210,6 @@ impl Drop for TempWorkDir {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::TaskKind;
 
     #[test]
     fn args_have_no_shell_and_all_flags() {

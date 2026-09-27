@@ -14,10 +14,14 @@ use rekon_core::Ctx;
 use rekon_core::init::{self, Options, Progress};
 use rekon_core::jobs::{JobDone, JobKey, JobPool};
 use rekon_core::model::{Blocks, DirNote, FileNote, Freshness, ProjectNote, freshness};
+use rekon_core::ontology::graph::GraphIndex;
+use rekon_core::ontology::index::{self as ontology, Progress as OntologyProgress};
+use rekon_core::ontology::model::{Edge, Evidence};
 use rekon_core::scan::{Excluder, Tree};
 use rekon_core::{segment, text};
 
 use super::editor::EditRequest;
+use super::graph::{Click, Dir, Explorer, Sel};
 use super::highlight::{self, Lines};
 use super::rows::{self, BlockView, Desc, Row, RowKind, RowRef};
 
@@ -30,6 +34,8 @@ pub enum Bg {
     Analyzed(Tree),
     InitProgress(Progress),
     InitDone(Result<String, String>),
+    OntologyProgress(OntologyProgress),
+    OntologyDone(Result<String, String>),
     Highlighted {
         path: String,
         hash: String,
@@ -41,6 +47,28 @@ pub enum Bg {
 pub enum Focus {
     Tree,
     Code,
+}
+
+/// Representation of the project in the left panel (its tabs).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum View {
+    Tree,
+    Ontology,
+}
+
+/// Evidence of the element selected in the graph, shown in the code panel.
+pub struct EvidenceNav {
+    pub sel: Sel,
+    /// What the evidence proves, e.g. `Store —writes→ notes`.
+    pub title: String,
+    pub items: Vec<Evidence>,
+    pub index: usize,
+}
+
+impl EvidenceNav {
+    pub fn current(&self) -> &Evidence {
+        &self.items[self.index]
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -201,6 +229,16 @@ pub struct App {
     pub expanded_blocks: HashSet<(String, (u32, u32))>,
     pub focus: Focus,
     pub wide: bool,
+    /// What the left panel shows: the tree or the ontology graph.
+    pub view: View,
+    pub explorer: Explorer,
+    pub evidence: Option<EvidenceNav>,
+    /// Ontology analysis running in the background.
+    pub ontology: Option<OntologyProgress>,
+    /// Tabs of the left panel in the last frame, for clicks.
+    pub tabs: Vec<(Rect, View)>,
+    /// One-time message for the status line, cleared by the next key.
+    pub notice: Option<String>,
     /// Descriptions only in the code panel (`o`).
     pub desc_only: bool,
     pub popup: Option<Popup>,
@@ -255,6 +293,12 @@ impl App {
             expanded_blocks: HashSet::new(),
             focus: Focus::Tree,
             wide: false,
+            view: View::Tree,
+            explorer: Explorer::default(),
+            evidence: None,
+            ontology: None,
+            tabs: Vec::new(),
+            notice: None,
             desc_only: false,
             popup: None,
             open: None,
@@ -340,6 +384,47 @@ impl App {
         });
     }
 
+    /// Runs the ontology analysis in the background: files changed since the last
+    /// run, or `paths` again with `force`.
+    fn start_ontology(&mut self, paths: Option<Vec<String>>, force: bool) {
+        if self.ontology.is_some() {
+            return;
+        }
+        if let Err(e) = init::prepare(&self.ctx.root) {
+            self.error(format!("ontology: {e:#}"));
+            return;
+        }
+        self.ontology = Some(OntologyProgress::default());
+        let ctx = Arc::clone(&self.ctx);
+        let tx = self.bg_tx.clone();
+        std::thread::spawn(move || {
+            let progress_tx = std::sync::Mutex::new(tx.clone());
+            let on_progress = |p: &OntologyProgress| {
+                let _ = progress_tx.lock().map(|t| t.send(Bg::OntologyProgress(p.clone())));
+            };
+            let opts = ontology::Options {
+                force,
+                paths,
+                dry_run: false,
+            };
+            let result = ontology::run(&ctx, &opts, &on_progress)
+                .map(|r| text::ontology_done(r.analyzed, r.nodes, r.edges, r.errors))
+                .map_err(|e| format!("ontology: {e:#}"));
+            let _ = tx.send(Bg::OntologyDone(result));
+        });
+    }
+
+    /// Switches the left panel between the tree and the ontology graph.
+    pub fn set_view(&mut self, view: View) {
+        self.view = view;
+        if view == View::Ontology {
+            if self.explorer.area.width == 0 {
+                self.explorer.area = self.tree_panel.area;
+            }
+            self.explorer.load(self.ctx.store.dir());
+        }
+    }
+
     pub fn error(&mut self, message: String) {
         self.errors += 1;
         self.last_error = Some(message);
@@ -367,6 +452,15 @@ impl App {
                     self.notes.clear();
                     if let Err(e) = result {
                         self.error(e);
+                    }
+                }
+                Bg::OntologyProgress(p) => self.ontology = Some(p),
+                Bg::OntologyDone(result) => {
+                    self.ontology = None;
+                    self.explorer.load(self.ctx.store.dir());
+                    match result {
+                        Ok(m) => self.notice = Some(m),
+                        Err(e) => self.error(e),
                     }
                 }
                 Bg::Highlighted { path, hash, lines } => {
@@ -404,8 +498,12 @@ impl App {
         }
     }
 
-    /// Every 2 s: re-stat visible files and the open file, reload changed notes.
+    /// Every 2 s: re-stat visible files and the open file, reload changed notes (and
+    /// the ontology graph, when it changed on disk).
     pub fn tick(&mut self) {
+        if self.view == View::Ontology && self.explorer.load(self.ctx.store.dir()) {
+            self.dirty = true;
+        }
         let (start, end) = (
             self.tree_panel.offset,
             self.tree_panel.offset + self.tree_panel.height(),
@@ -549,7 +647,12 @@ impl App {
     }
 
     fn build_code_rows(&mut self, width: usize) -> Vec<Row> {
-        let blocks = self.open_blocks();
+        // Evidence is shown in plain lines, so its range reads as in the file.
+        let blocks = if self.evidence_lines().is_some() {
+            None
+        } else {
+            self.open_blocks()
+        };
         let Some(open) = &self.open else { return Vec::new() };
         let hl = open.highlighted.as_ref().map(|h| h.as_slice());
         let Some(blocks) = blocks.filter(|b| !b.items.is_empty()) else {
@@ -597,6 +700,7 @@ impl App {
 
     pub fn on_key(&mut self, key: KeyEvent) {
         self.dirty = true;
+        self.notice = None;
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.quit = true;
             return;
@@ -610,6 +714,16 @@ impl App {
                 }
                 _ => {}
             }
+            return;
+        }
+        match key.code {
+            KeyCode::Char('1') => return self.set_view(View::Tree),
+            KeyCode::Char('2') => return self.set_view(View::Ontology),
+            KeyCode::Char('[') => return self.evidence_step(-1),
+            KeyCode::Char(']') => return self.evidence_step(1),
+            _ => {}
+        }
+        if self.view == View::Ontology && self.focus == Focus::Tree && self.graph_key(key) {
             return;
         }
         let page = match self.focus {
@@ -648,6 +762,133 @@ impl App {
             KeyCode::Left | KeyCode::Char('h') => self.back(),
             _ => {}
         }
+    }
+
+    /// Keys of the graph panel; false for keys left to the common handling.
+    fn graph_key(&mut self, key: KeyEvent) -> bool {
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        let half = i32::from(self.explorer.area.height / 2).max(1);
+        match key.code {
+            KeyCode::Up if shift => self.explorer.pan(0, -3),
+            KeyCode::Down if shift => self.explorer.pan(0, 3),
+            KeyCode::Left if shift => self.explorer.pan(-8, 0),
+            KeyCode::Right if shift => self.explorer.pan(8, 0),
+            KeyCode::Up | KeyCode::Char('k') => self.explorer.go(Dir::Up),
+            KeyCode::Down | KeyCode::Char('j') => self.explorer.down(),
+            KeyCode::Left | KeyCode::Char('h') => self.explorer.go(Dir::Left),
+            KeyCode::Right | KeyCode::Char('l') => self.explorer.go(Dir::Right),
+            KeyCode::Char(' ') => self.explorer.toggle(),
+            KeyCode::Backspace => self.explorer.collapse_selected(),
+            KeyCode::Esc => self.explorer.up_level(),
+            KeyCode::Enter => self.show_evidence(),
+            KeyCode::Char('+') | KeyCode::Char('=') => self.explorer.zoom_step(1, None),
+            KeyCode::Char('-') => self.explorer.zoom_step(-1, None),
+            KeyCode::Char('0') => self.explorer.zoom_to(1.0, None),
+            KeyCode::Char('c') => self.explorer.center = Some(0.33),
+            KeyCode::Home => self.explorer.select_root(),
+            KeyCode::PageUp => self.explorer.pan(0, -half),
+            KeyCode::PageDown => self.explorer.pan(0, half),
+            KeyCode::Char('L') => {
+                if self.explorer.lineage() == 0 {
+                    self.notice = Some(text::NO_LINEAGE.into());
+                }
+            }
+            KeyCode::Char('R') => self.start_ontology(None, false),
+            KeyCode::Char('r') => {
+                let files = self.selection_files();
+                if !files.is_empty() {
+                    self.start_ontology(Some(files), true);
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// Files of the evidence of the element selected in the graph.
+    fn selection_files(&self) -> Vec<String> {
+        let (Some(g), Some(sel)) = (&self.explorer.graph, &self.explorer.sel) else {
+            return Vec::new();
+        };
+        let evidence = match sel {
+            Sel::Node(id) => g.node(id).map(|n| &n.evidence),
+            Sel::Edge(id) => g.edge(id).map(|e| &e.evidence),
+            Sel::More(_) => None,
+        };
+        let mut files: Vec<String> = evidence.into_iter().flatten().map(|e| e.file.clone()).collect();
+        files.sort();
+        files.dedup();
+        files
+    }
+
+    /// Enter in the graph: the evidence of the selected element in the code panel;
+    /// again on the same element, its next evidence.
+    fn show_evidence(&mut self) {
+        let Some(sel) = self.explorer.sel.clone() else { return };
+        if let Some(ev) = self.evidence.as_mut().filter(|ev| ev.sel == sel) {
+            ev.index = (ev.index + 1) % ev.items.len();
+            self.open_evidence();
+            return;
+        }
+        let Some(g) = self.explorer.graph.clone() else { return };
+        let (title, items) = match &sel {
+            Sel::Node(id) => match g.node(id) {
+                Some(n) => (format!("{} · {}", n.kind, n.name), n.evidence.clone()),
+                None => return,
+            },
+            Sel::Edge(id) => match g.edge(id) {
+                Some(e) => (edge_title(&g, e), e.evidence.clone()),
+                None => return,
+            },
+            Sel::More(id) => return self.explorer.show_more(&id.clone()),
+        };
+        if items.is_empty() {
+            self.notice = Some(text::NO_EVIDENCE.into());
+            return;
+        }
+        self.evidence = Some(EvidenceNav {
+            sel,
+            title,
+            items,
+            index: 0,
+        });
+        self.open_evidence();
+    }
+
+    /// `[` / `]`: previous or next evidence of the element shown.
+    fn evidence_step(&mut self, delta: isize) {
+        let Some(ev) = self.evidence.as_mut() else { return };
+        let n = ev.items.len() as isize;
+        ev.index = (ev.index as isize + delta).rem_euclid(n) as usize;
+        self.open_evidence();
+    }
+
+    /// Opens the file of the current evidence (without splitting it into blocks) and
+    /// scrolls to its lines.
+    fn open_evidence(&mut self) {
+        let Some(item) = self.evidence.as_ref().map(|ev| ev.current().clone()) else {
+            return;
+        };
+        if self.open.as_ref().is_none_or(|o| o.path != item.file) {
+            self.code_panel = Panel {
+                follow: true,
+                area: self.code_panel.area,
+                ..Default::default()
+            };
+            self.reload_open(&item.file);
+        }
+        let start = item.start_line.max(1);
+        self.code_panel.sel = start as usize - 1;
+        self.code_panel.offset = (start as usize - 1).saturating_sub(3);
+        self.code_panel.follow = true;
+        self.code_sel_key = Some(RowRef::Line(start));
+        self.dirty = true;
+    }
+
+    /// Lines of the evidence shown in the open file.
+    pub fn evidence_lines(&self) -> Option<(u32, u32)> {
+        let ev = self.evidence.as_ref()?.current();
+        (self.open.as_ref()?.path == ev.file).then_some((ev.start_line, ev.end_line))
     }
 
     /// Moves the selection; in the code panel with blocks it only stops on headers.
@@ -795,6 +1036,18 @@ impl App {
 
     pub fn on_mouse(&mut self, m: MouseEvent) {
         let (x, y) = (m.column, m.row);
+        if m.kind == MouseEventKind::Down(MouseButton::Left)
+            && let Some(&(_, view)) = self.tabs.iter().find(|(r, _)| r.contains((x, y).into()))
+        {
+            self.set_view(view);
+            self.dirty = true;
+            return;
+        }
+        let in_graph = self.explorer.area.contains((x, y).into());
+        if self.view == View::Ontology && (self.explorer.dragging() || in_graph) {
+            self.graph_mouse(m);
+            return;
+        }
         let focus = if self.tree_panel.contains(x, y) {
             Focus::Tree
         } else if !self.wide && self.code_panel.contains(x, y) {
@@ -828,6 +1081,29 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// Mouse in the graph: click selects, double click expands (a node) or shows the
+    /// evidence (an edge), dragging moves a node or the view, the wheel zooms.
+    fn graph_mouse(&mut self, m: MouseEvent) {
+        let (x, y) = (m.column, m.row);
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.focus = Focus::Tree;
+                match self.explorer.press(x, y) {
+                    Some(Click::Double(Sel::Node(_))) => self.explorer.toggle(),
+                    Some(Click::Double(Sel::More(id))) => self.explorer.show_more(&id),
+                    Some(Click::Double(Sel::Edge(_))) => self.show_evidence(),
+                    _ => {}
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => self.explorer.drag_to(x, y),
+            MouseEventKind::Up(MouseButton::Left) => self.explorer.release(),
+            MouseEventKind::ScrollUp => self.explorer.zoom_step(1, Some((x, y))),
+            MouseEventKind::ScrollDown => self.explorer.zoom_step(-1, Some((x, y))),
+            _ => return,
+        }
+        self.dirty = true;
     }
 
     /// Click on row `index` of the focused panel: select, then expand/collapse or open.
@@ -950,8 +1226,19 @@ impl App {
     /// `e`: asks the event loop to suspend the TUI and run the editor on the open file
     /// (at the selected block) or on the file selected in the tree.
     fn request_editor(&mut self) {
+        let selected_line = match self.code_rows.get(self.code_panel.sel).map(|r| &r.target) {
+            Some(RowRef::Line(nr)) => Some(*nr),
+            _ => None,
+        };
         let (path, line) = match (self.focus, &self.open) {
-            (Focus::Code, Some(open)) => (open.path.clone(), self.selected_block().map_or(1, |r| r.0)),
+            (Focus::Tree, _) if self.view == View::Ontology => match &self.evidence {
+                Some(ev) => (ev.current().file.clone(), ev.current().start_line),
+                None => return,
+            },
+            (Focus::Code, Some(open)) => (
+                open.path.clone(),
+                self.selected_block().map(|r| r.0).or(selected_line).unwrap_or(1),
+            ),
             _ => match self.selected_tree_path().and_then(|p| self.tree.get(p)) {
                 Some(i) if !self.tree.node(i).is_dir => (self.tree.node(i).path.clone(), 1),
                 _ => return,
@@ -996,6 +1283,7 @@ impl App {
     // ----- open file -----
 
     pub fn open_file(&mut self, path: &str) {
+        self.evidence = None;
         self.code_panel = Panel {
             follow: true,
             area: self.code_panel.area,
@@ -1063,6 +1351,9 @@ impl App {
 
     /// Full description of the selected item, for the footer.
     pub fn selected_description(&mut self) -> String {
+        if self.view == View::Ontology && self.focus == Focus::Tree {
+            return self.graph_description();
+        }
         if self.focus == Focus::Code
             && let Some(open) = &self.open
         {
@@ -1100,9 +1391,34 @@ impl App {
         format!("{shown} — {desc}")
     }
 
-    pub fn jobs_running(&self) -> usize {
-        self.pool.pending_count() + usize::from(self.init.is_some())
+    fn graph_description(&self) -> String {
+        let (Some(g), Some(sel)) = (&self.explorer.graph, &self.explorer.sel) else {
+            return String::new();
+        };
+        match sel {
+            Sel::Node(id) => g.node(id).map_or_else(String::new, |n| {
+                let description = n.description.as_deref().unwrap_or(text::NO_DESCRIPTION);
+                text::node_line(&n.kind, &n.name, description, n.confidence, n.evidence.len(), &n.id)
+            }),
+            Sel::Edge(id) => g.edge(id).map_or_else(String::new, |e| {
+                text::edge_line(&edge_title(g, e), e.confidence, e.evidence.len())
+            }),
+            Sel::More(id) => {
+                let count = self.explorer.more.get(id).map_or(0, |m| m.count);
+                text::more_line(count, g.node(id).map_or("", |n| n.name.as_str()))
+            }
+        }
     }
+
+    pub fn jobs_running(&self) -> usize {
+        self.pool.pending_count() + usize::from(self.init.is_some()) + usize::from(self.ontology.is_some())
+    }
+}
+
+/// `source —relation→ target` with node names.
+fn edge_title(g: &GraphIndex, e: &Edge) -> String {
+    let name = |id: &str| g.node(id).map_or_else(|| id.to_string(), |n| n.name.clone());
+    format!("{} —{}→ {}", name(&e.source), e.relation, name(&e.target))
 }
 
 fn to_desc(text: Option<String>, f: Freshness, pending: bool) -> Desc {
