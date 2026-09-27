@@ -55,8 +55,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     app.rebuild(app.tree_panel.area.width as usize, app.code_panel.area.width as usize);
     let (tree_len, code_len) = (app.tree_rows.len(), app.code_rows.len());
-    app.tree_panel.scroll_to_selection(tree_len);
-    app.code_panel.scroll_to_selection(code_len);
+    app.tree_panel.scroll_to_selection(tree_len, app.tree_panel.sel + 1);
+    let code_end = super::rows::selection_end(&app.code_rows, app.code_panel.sel);
+    app.code_panel.scroll_to_selection(code_len, code_end);
 
     draw_header(f, app, header);
     f.render_widget(tree_block, tree_area);

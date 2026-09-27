@@ -104,14 +104,16 @@ impl Panel {
         self.area.height as usize
     }
 
-    /// Adjusts the offset so the selection is visible (when following).
-    pub fn scroll_to_selection(&mut self, rows: usize) {
+    /// Adjusts the offset so the selection, rows `sel..end`, is visible (when following);
+    /// a selection taller than the panel shows its top.
+    pub fn scroll_to_selection(&mut self, rows: usize, end: usize) {
         let h = self.height().max(1);
         if self.follow {
+            let end = end.max(self.sel + 1);
             if self.sel < self.offset {
                 self.offset = self.sel;
-            } else if self.sel >= self.offset + h {
-                self.offset = self.sel + 1 - h;
+            } else if end > self.offset + h {
+                self.offset = self.sel.min(end - h);
             }
         }
         self.offset = self.offset.min(rows.saturating_sub(h));
