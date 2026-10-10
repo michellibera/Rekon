@@ -1,13 +1,13 @@
 //! Terminal UI: tree of the repository on the left, code split into blocks on the right.
 
 mod app;
-mod editor;
-mod graph;
-#[cfg(test)]
-mod graph_tests;
+mod changes;
+pub(crate) mod editor;
 mod highlight;
 mod render;
 mod rows;
+#[cfg(test)]
+mod insight_tests;
 #[cfg(test)]
 mod tests;
 

@@ -47,5 +47,48 @@ pub fn render(ctx: &Ctx, exe: &str) -> Result<String> {
     if total > MAX_LINES {
         out.push_str(&format!("… {} more lines ({exe} tree)\n", total - MAX_LINES));
     }
+    out.push_str(&insight_section(ctx, exe));
     Ok(out)
+}
+
+/// What the person and the agent share beyond descriptions: decisions in force,
+/// specifications waiting for implementation, and how to record new ones. Empty when
+/// nothing was recorded yet, so a plain map stays plain.
+fn insight_section(ctx: &Ctx, exe: &str) -> String {
+    use crate::{cards, decisions};
+    let ds: Vec<_> = decisions::list(ctx)
+        .into_iter()
+        .filter(|d| d.status != decisions::Status::Superseded)
+        .collect();
+    let specs: Vec<_> = cards::list(ctx)
+        .into_iter()
+        .filter(|c| c.status == cards::Status::Proposed && c.origin == crate::model::Origin::Human)
+        .collect();
+    let changed = crate::review::changes(ctx).map_or(0, |c| c.len());
+    if ds.is_empty() && specs.is_empty() && changed == 0 {
+        return String::new();
+    }
+    let mut out = String::from("\nDecisions and specifications kept in rekon:\n");
+    if !ds.is_empty() {
+        out.push_str("Decisions in force (do not undo one silently; if a change breaks its assumptions, say so and replace it):\n");
+        for d in ds.iter().take(15) {
+            let mark = if d.status == decisions::Status::Proposed { " (unconfirmed, inferred by a model)" } else { "" };
+            let on = if d.elements.is_empty() { String::new() } else { format!(" [{}]", d.elements.join(", ")) };
+            out.push_str(&format!("- {}: {}{on}{mark}. Reconsider if: {}\n", d.id, d.decision, if d.revisit_if.is_empty() { "-" } else { &d.revisit_if }));
+        }
+    }
+    if !specs.is_empty() {
+        out.push_str(&format!("Specifications written by the user, waiting for implementation (`{exe} card brief <id>`):\n"));
+        for c in specs.iter().take(10) {
+            out.push_str(&format!("- {}: {}\n", c.id, c.title));
+        }
+    }
+    if changed > 0 {
+        out.push_str(&format!("{changed} element(s) changed since the user last reviewed them (`{exe} review status`); explain non-obvious changes.\n"));
+    }
+    out.push_str(&format!(
+        "Record what you decide: `{exe} decision add` (JSON on stdin: title, decision, context, cost, revisit_if, assumptions[], elements[]) \
+         for a design choice with a reason; `{exe} card add` (title, before, after, consequences[]) for a change of behaviour.\n"
+    ));
+    out
 }

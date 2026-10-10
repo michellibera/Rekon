@@ -16,7 +16,6 @@ pub const NO_DESCRIPTION: &str = "no description";
 pub const PENDING: &str = "…";
 pub const NOT_A_REPO: &str = "rekon needs a git repository (git rev-parse --show-toplevel failed)";
 pub const NO_MAP: &str = "no .rekon/ map in this repository; run `rekon init` first";
-pub const NO_GRAPH: &str = "no ontology in this repository yet; run `rekon ontology index` first";
 
 pub fn claude_missing(err: &str) -> String {
     format!(
@@ -30,10 +29,6 @@ pub fn progress_line(files: (usize, usize), dirs: (usize, usize), errors: usize,
         "Files {}/{} · Folders {}/{} · Errors {} · ~${:.2}",
         files.0, files.1, dirs.0, dirs.1, errors, cost
     )
-}
-
-pub fn ontology_progress(done: usize, total: usize, errors: usize, cost: f64) -> String {
-    format!("Ontology {done}/{total} files · Errors {errors} · ~${cost:.2}")
 }
 
 pub fn stop_hook_reason(exe: &str, paths: &[String]) -> String {
@@ -62,13 +57,7 @@ pub fn stop_hook_reason(exe: &str, paths: &[String]) -> String {
 pub const TREE_TITLE: &str = "Tree";
 pub const CODE_TITLE_EMPTY: &str = "Code";
 pub const OVERVIEW_TITLE: &str = "Project overview";
-pub const FILTER_TITLE: &str = "Graph filters: nothing picked shows all (Space: pick, f or Esc: close)";
-pub const FILTER_KINDS: &str = "Node types";
-pub const FILTER_RELATIONS: &str = "Relations";
 
-pub fn reveal_stopped(max: usize) -> String {
-    format!("filters revealed the first {max} matching nodes; pick more to narrow them")
-}
 pub const HELP_TITLE: &str = "Keys";
 pub const NO_OVERVIEW: &str = "No overview yet. Run `rekon init` (or wait for the background init).";
 pub const SELECT_FILE: &str = "Select a file in the tree to see its code.";
@@ -89,7 +78,7 @@ pub fn status_line(jobs: usize, errors: usize, last_error: Option<&str>, cost: f
 }
 
 pub const HELP: &[(&str, &str)] = &[
-    ("1 / 2", "tree view / ontology view of the left panel"),
+    ("1 / 2", "left panel: tree / changes since your review"),
     ("↑/↓, k/j", "previous/next item (in the code panel: block header)"),
     ("→/l, Enter", "expand folder, open file, expand block"),
     ("←/h", "collapse or go to parent"),
@@ -104,20 +93,31 @@ pub const HELP: &[(&str, &str)] = &[
     ("?", "this help"),
     ("q", "quit (Esc closes a window)"),
     ("mouse", "click selects and expands or collapses, wheel scrolls"),
+    ("3 4 5 6", "left panel: decisions / cards / criteria / questions"),
+    ("v / V", "right panel view: code, relations, why, contract, example, compare"),
+    ("P  < >", "pin the element for comparison; back / forward through visited elements"),
+    ("m", "mark the file or folder as understood (changes view: accept the change)"),
+    ("u", "changes view: ask the model what the change means for you"),
 ];
 
-// Ontology view.
+// Views.
 
 pub const TAB_TREE: &str = "Tree";
-pub const TAB_ONTOLOGY: &str = "Ontology";
-pub const NO_ONTOLOGY: &str = "No ontology yet. R maps this repository onto the ontology with the model (like      `rekon ontology index`); later runs analyze only changed files.";
-pub const ONTOLOGY_RUNNING: &str = "Analyzing the repository; the graph appears when the analysis ends.";
-pub const NO_EVIDENCE: &str = "no evidence for this element";
-pub fn group_line(relation: &str, count: usize, name: &str) -> String {
-    format!("{count} neighbors of {name} by \"{relation}\": Space or Enter shows them")
+pub const TAB_CHANGES: &str = "Changes";
+pub const TAB_WHY: &str = "Why";
+pub const TAB_CARDS: &str = "Cards";
+pub const TAB_CRITERIA: &str = "Criteria";
+pub const TAB_ASK: &str = "Ask";
+pub const NO_CHANGES: &str = "Nothing changed since your review. Mark code you understand with m in the tree (a file or a folder); opening a file does not count.";
+pub const UPDATE_ASKED: &str = "asking the model for an update of your mental model...";
+
+pub fn accepted(name: &str) -> String {
+    format!("accepted: {name}")
 }
 
-pub const HELP_ONTOLOGY_TITLE: &str = "Ontology view";
+pub fn marked(files: usize, elements: usize) -> String {
+    format!("marked as understood: {elements} elements in {files} files")
+}
 
 /// Title of the code panel showing evidence: what it proves, which one, where, why.
 pub fn evidence_title(element: &str, index: usize, total: usize, location: &str, reason: &str) -> String {
@@ -127,60 +127,6 @@ pub fn evidence_title(element: &str, index: usize, total: usize, location: &str,
     } else {
         format!("{base} — {reason}")
     }
-}
-
-pub fn more_neighbors(count: usize) -> String {
-    format!("+{count} more")
-}
-
-pub const NO_LINEAGE: &str = "no data lineage (derivedFrom) from this element";
-
-pub fn ontology_done(analyzed: usize, nodes: usize, edges: usize, errors: usize) -> String {
-    format!("ontology: {analyzed} files analyzed · {nodes} nodes · {edges} edges · {errors} errors")
-}
-
-/// Footer line of a node selected in the graph.
-pub fn node_line(kind: &str, name: &str, description: &str, confidence: f64, evidence: usize, id: &str) -> String {
-    format!("{kind} · {name} — {description} · confidence {confidence} · evidence {evidence} · {id}")
-}
-
-/// Footer line of an edge selected in the graph.
-pub fn edge_line(title: &str, confidence: f64, evidence: usize) -> String {
-    format!("{title} · confidence {confidence} · evidence {evidence} · Enter shows the code")
-}
-
-pub fn more_line(count: usize, name: &str) -> String {
-    format!("{count} more neighbors of {name}: Space or Enter shows them")
-}
-
-pub const HELP_ONTOLOGY: &[(&str, &str)] = &[
-    ("arrows, hjkl", "move to the nearest element in that direction"),
-    (
-        "Space",
-        "expand or collapse the selected node (its neighbors appear below it)",
-    ),
-    ("Backspace", "collapse the node (or the node above it)"),
-    ("Enter", "show the evidence in the code panel (again: the next one)"),
-    ("[ / ]", "previous / next evidence"),
-    ("Esc", "select the node one level up"),
-    ("+ / - / 0", "zoom in / out / back to 100%"),
-    ("c / Home", "center on the selection / go to the root"),
-    (
-        "f",
-        "filters: only nodes of the picked types / joined by the picked relations",
-    ),
-    ("L", "reveal the data lineage (derivedFrom) of the selection"),
-    ("R / r", "analyze changed files / the selection's files again"),
-    (
-        "mouse",
-        "click selects, double click expands, drag pans or moves a node, wheel zooms",
-    ),
-];
-
-/// Marker of a node's hidden neighbors joined by one relation (the relation is on
-/// the line to it).
-pub fn relation_group(count: usize) -> String {
-    format!("{count} ▸")
 }
 
 pub fn human_size(bytes: u64) -> String {

@@ -6,12 +6,22 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 
+/// What to do with a template after the editor closes.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Followup {
+    Decision { supersede: Option<String> },
+    Card { elements: Vec<String> },
+    Contract { element: String },
+}
+
 pub struct EditRequest {
     pub path: String,
     pub abs: PathBuf,
     pub line: u32,
     /// Content hash before editing, to detect a change.
     pub hash_before: Option<String>,
+    /// Set for a template file (not source code): parsed and saved after editing.
+    pub followup: Option<Followup>,
 }
 
 fn default_editor() -> String {
@@ -43,9 +53,25 @@ pub fn command(editor_cmd: Option<&str>, file: &Path, line: u32) -> Result<(Stri
     Ok((program, words))
 }
 
-/// Runs the editor in the foreground and waits for it.
-pub fn run(editor_cmd: Option<&str>, req: &EditRequest) -> Result<()> {
-    let (program, args) = command(editor_cmd, &req.abs, req.line)?;
+/// Opens `initial` in the editor as a temporary file and returns what was saved.
+pub fn edit_temp(editor_cmd: Option<&str>, initial: &str, ext: &str) -> Result<String> {
+    let path = temp_file(initial, ext)?;
+    let result = run_file(editor_cmd, &path, 1).and_then(|()| Ok(std::fs::read_to_string(&path)?));
+    let _ = std::fs::remove_file(&path);
+    result
+}
+
+/// Writes `text` to a new temporary file (for a template edited in the TUI).
+pub fn temp_file(text: &str, ext: &str) -> Result<PathBuf> {
+    static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("rekon-{}-{n}.{ext}", std::process::id()));
+    std::fs::write(&path, text).with_context(|| format!("cannot write {}", path.display()))?;
+    Ok(path)
+}
+
+fn run_file(editor_cmd: Option<&str>, file: &Path, line: u32) -> Result<()> {
+    let (program, args) = command(editor_cmd, file, line)?;
     let status = Command::new(&program)
         .args(&args)
         .status()
@@ -54,6 +80,11 @@ pub fn run(editor_cmd: Option<&str>, req: &EditRequest) -> Result<()> {
         bail!("{program} exited with {status}");
     }
     Ok(())
+}
+
+/// Runs the editor in the foreground and waits for it.
+pub fn run(editor_cmd: Option<&str>, req: &EditRequest) -> Result<()> {
+    run_file(editor_cmd, &req.abs, req.line)
 }
 
 #[cfg(test)]

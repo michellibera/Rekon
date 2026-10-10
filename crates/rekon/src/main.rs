@@ -1,5 +1,6 @@
 //! `rekon` binary: CLI subcommands; without a subcommand it opens the TUI.
 
+mod cli_insight;
 mod tui;
 
 use std::io::{IsTerminal, Read, Write};
@@ -9,7 +10,6 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use rekon_core::init::{self, Options, Progress};
 use rekon_core::model::Author;
-use rekon_core::ontology;
 use rekon_core::scan::{Tree, normalize_prefix};
 use rekon_core::{Ctx, apply, check, context, segment, setup, view};
 
@@ -80,12 +80,51 @@ enum Cmd {
         #[arg(long)]
         hook: bool,
     },
-    /// Map the repository onto the ontology: a graph of components, interfaces, data and events
-    /// with the code that proves every element and relation
-    Ontology {
+    /// Your review baseline: mark code as understood, then see what changed since
+    Review {
         #[command(subcommand)]
-        command: OntologyCmd,
+        command: ReviewCmd,
     },
+    /// Why is it like this: decisions with reasons, costs and assumptions, pinned to elements
+    Decision {
+        #[command(subcommand)]
+        command: cli_insight::DecisionCmd,
+    },
+    /// Behaviour-change cards: before, after, consequences, basis
+    Card {
+        #[command(subcommand)]
+        command: cli_insight::CardCmd,
+    },
+    /// Current and desired contract of an element
+    Contract {
+        #[command(subcommand)]
+        command: cli_insight::ContractCmd,
+    },
+    /// Progress as met conditions: implementation, verification and your review, separately
+    Criteria {
+        #[command(subcommand)]
+        command: cli_insight::CriteriaCmd,
+    },
+    /// Pin a question and get the elements that answer it, and what was left out
+    Ask {
+        #[command(subcommand)]
+        command: cli_insight::AskCmd,
+    },
+    /// Walk through an element with a concrete input (a prediction, marked as such)
+    Trace {
+        element: String,
+        /// Your own example input
+        #[arg(long)]
+        input: Option<String>,
+        /// The result you expect for this example
+        #[arg(long)]
+        expect: Option<String>,
+        /// Turn the expectation into a card for an agent
+        #[arg(long)]
+        card: bool,
+    },
+    /// Relations of an element or file: calls, callers, tests, decisions, cards
+    Relations { element: String },
     /// Install the rekon-init skill and the hooks in ~/.claude (once per machine)
     Setup {
         /// Only show the changes
@@ -98,25 +137,21 @@ enum Cmd {
 }
 
 #[derive(Subcommand)]
-enum OntologyCmd {
-    /// Analyze changed files with the model and rebuild .rekon/ontology/graph.json
-    Index {
-        /// Only these files
-        paths: Vec<String>,
-        /// Analyze the files again even when unchanged
-        #[arg(long)]
-        force: bool,
-        /// Only list the model requests it would make
-        #[arg(long)]
-        dry_run: bool,
-    },
-    /// Print a node with its evidence and relations; without ID the root and counts per type
-    Show {
-        /// Node id or name, e.g. component:store or Store
-        id: Option<String>,
+enum ReviewCmd {
+    /// Mark the current version of a file (all its elements) as understood
+    Mark { path: String },
+    /// List what changed since you last marked it, with how much it matters
+    Status {
         #[arg(long)]
         json: bool,
     },
+    /// Ask the model how your mental model of a changed element should change
+    Update {
+        /// Element id or a unique part of it, e.g. src/a.rs::Store::run
+        id: String,
+    },
+    /// Accept a change (or a rename, or a removal) as understood
+    Accept { id: String },
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -271,46 +306,19 @@ fn run(cli: Cli) -> Result<u8> {
             print!("{}", context::render(&ctx, &setup::exe_path()?)?);
             Ok(0)
         }
-        Cmd::Ontology {
-            command: OntologyCmd::Index { paths, force, dry_run },
-        } => {
-            let root = rekon_core::scan::find_root(&cwd)?;
-            init::prepare(&root)?;
-            let ctx = Ctx::at_root(&root)?;
-            let paths = (!paths.is_empty()).then(|| paths.iter().map(|p| rel_prefix(&ctx, &cwd, Some(p))).collect());
-            cmd_ontology(&ctx, ontology::index::Options { force, paths, dry_run })
-        }
-        Cmd::Ontology {
-            command: OntologyCmd::Show { id, json },
-        } => {
-            let ctx = open_with_map(&cwd)?;
-            let Some(g) = ontology::graph::load(ctx.store.dir())? else {
-                return Err(Usage(rekon_core::text::NO_GRAPH.into()).into());
-            };
-            let Some(query) = id else {
-                print!("{}", ontology::view::summary_text(&g));
-                return Ok(0);
-            };
-            let found = g.find(&query);
-            match found.as_slice() {
-                [] => Err(Usage(format!("no node matches {query}")).into()),
-                [n] if json => {
-                    println!("{}", serde_json::to_string_pretty(&ontology::view::node_json(&g, n))?);
-                    Ok(0)
-                }
-                [n] => {
-                    print!("{}", ontology::view::node_text(&g, n));
-                    Ok(0)
-                }
-                many => {
-                    eprintln!("{} nodes match {query}:", many.len());
-                    for n in many {
-                        println!("{} · {} ({})", n.kind, n.name, n.id);
-                    }
-                    Ok(USAGE)
-                }
-            }
-        }
+        Cmd::Review { command } => cmd_review(&cwd, command),
+        Cmd::Decision { command } => cli_insight::decision(&open_with_map(&cwd)?, &cwd, command),
+        Cmd::Card { command } => cli_insight::card(&open_with_map(&cwd)?, command),
+        Cmd::Contract { command } => cli_insight::contract(&open_with_map(&cwd)?, &cwd, command),
+        Cmd::Criteria { command } => cli_insight::criteria_cmd(&open_with_map(&cwd)?, &cwd, command),
+        Cmd::Ask { command } => cli_insight::ask(&open_with_map(&cwd)?, command),
+        Cmd::Trace {
+            element,
+            input,
+            expect,
+            card,
+        } => cli_insight::trace_cmd(&open_with_map(&cwd)?, &cwd, &element, input, expect, card),
+        Cmd::Relations { element } => cli_insight::relations_cmd(&open_with_map(&cwd)?, &cwd, &element),
         Cmd::Setup { dry_run, opencode } => {
             let dir = setup::claude_dir()?;
             let changes = if opencode {
@@ -332,7 +340,7 @@ fn run(cli: Cli) -> Result<u8> {
 
 /// Error that maps to exit code 2.
 #[derive(Debug)]
-struct Usage(String);
+pub(crate) struct Usage(pub(crate) String);
 
 impl std::fmt::Display for Usage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -348,6 +356,82 @@ fn log_hook_error(cwd: &std::path::Path, hook: &str, e: &anyhow::Error) {
     }
 }
 
+fn cmd_review(cwd: &std::path::Path, command: ReviewCmd) -> Result<u8> {
+    use rekon_core::review::{self, Status};
+    let ctx = open_with_map(cwd)?;
+    let find = |id: &str| -> Result<review::Change> {
+        let all = review::changes(&ctx)?;
+        let hits: Vec<_> = all.iter().filter(|c| c.id == id).collect();
+        let hits = if hits.is_empty() {
+            all.iter().filter(|c| c.id.contains(id)).collect()
+        } else {
+            hits
+        };
+        match hits.as_slice() {
+            [c] => Ok((*c).clone()),
+            [] => Err(Usage(format!("no change matches {id}; see `rekon review status`")).into()),
+            many => Err(Usage(format!(
+                "{} changes match {id}: {}",
+                many.len(),
+                many.iter().map(|c| c.id.as_str()).collect::<Vec<_>>().join(", ")
+            ))
+            .into()),
+        }
+    };
+    match command {
+        ReviewCmd::Mark { path } => {
+            let rel = rel_prefix(&ctx, cwd, Some(&path));
+            let n = review::mark_file(&ctx, &rel)?;
+            println!("Marked {n} element(s) of {rel} as understood");
+        }
+        ReviewCmd::Status { json } => {
+            let changes = review::changes(&ctx)?;
+            if json {
+                let items: Vec<_> = changes
+                    .iter()
+                    .map(|c| {
+                        serde_json::json!({
+                            "id": c.id, "status": c.status.label(), "origin": c.origin().label(),
+                            "lines": [c.start, c.end], "callers": c.callers,
+                            "renamedTo": match &c.status { Status::Renamed(to) => Some(to), _ => None },
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&items)?);
+            } else if changes.is_empty() {
+                println!("Nothing changed since your review.");
+            }
+            if !json {
+                for c in &changes {
+                    let extra = match &c.status {
+                        Status::Renamed(to) => format!(" -> {to}"),
+                        Status::CallerChanged => format!(" (by {})", c.callers.join(", ")),
+                        _ => String::new(),
+                    };
+                    println!("{:<14} {}{extra}", c.status.label(), c.id);
+                }
+            }
+        }
+        ReviewCmd::Update { id } => {
+            let change = find(&id)?;
+            let u = review::update(&ctx, &change)?;
+            println!("[{}] {}", u.origin.label(), change.id);
+            println!("Assumed: {}", u.value.assumed);
+            println!("Now:     {}", u.value.now);
+            for p in &u.value.points {
+                println!("  - {} ({}:{})", p.text, change.path, p.line);
+            }
+            println!("Effort:  {}", u.value.effort);
+        }
+        ReviewCmd::Accept { id } => {
+            let change = find(&id)?;
+            review::accept(&ctx, &change)?;
+            println!("Accepted {}", change.id);
+        }
+    }
+    Ok(0)
+}
+
 fn open_with_map(cwd: &std::path::Path) -> Result<Ctx> {
     let ctx = Ctx::open(cwd)?;
     if !ctx.store.exists() {
@@ -357,7 +441,7 @@ fn open_with_map(cwd: &std::path::Path) -> Result<Ctx> {
 }
 
 /// Converts a path given relative to the current folder into a repository path.
-fn rel_prefix(ctx: &Ctx, cwd: &std::path::Path, path: Option<&str>) -> String {
+pub(crate) fn rel_prefix(ctx: &Ctx, cwd: &std::path::Path, path: Option<&str>) -> String {
     let given = normalize_prefix(path);
     let root = std::fs::canonicalize(&ctx.root).unwrap_or_else(|_| ctx.root.clone());
     let here = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
@@ -413,45 +497,6 @@ fn cmd_init(ctx: &Ctx, prefix: &str, force: bool) -> Result<u8> {
         report.removed,
         report.cost
     );
-    if report.errors > 0 {
-        eprintln!("Details in {}", ctx.store.dir().join("rekon.log").display());
-    }
-    Ok(if report.errors > 0 { 1 } else { 0 })
-}
-
-fn cmd_ontology(ctx: &Ctx, opts: ontology::index::Options) -> Result<u8> {
-    let tty = std::io::stderr().is_terminal();
-    let print = |p: &ontology::index::Progress| {
-        let mut err = std::io::stderr().lock();
-        if tty {
-            let _ = write!(err, "\r\x1b[2K{}", p.line());
-        } else {
-            let _ = writeln!(err, "{}", p.line());
-        }
-        let _ = err.flush();
-    };
-    let report = ontology::index::run(ctx, &opts, &print)?;
-    if opts.dry_run {
-        for (i, request) in report.planned.iter().enumerate() {
-            println!("request {}: {}", i + 1, request.join(", "));
-        }
-        eprintln!(
-            "Would analyze {} of {} files in {} model requests ({} unchanged).",
-            report.analyzed,
-            report.files,
-            report.planned.len(),
-            report.reused
-        );
-        return Ok(0);
-    }
-    if tty {
-        eprintln!();
-    }
-    eprintln!(
-        "Ontology: {} files ({} analyzed, {} unchanged) · {} nodes · {} edges · errors: {} · cost ~${:.2}",
-        report.files, report.analyzed, report.reused, report.nodes, report.edges, report.errors, report.cost
-    );
-    eprintln!("Graph: {}", ontology::graph_path(ctx.store.dir()).display());
     if report.errors > 0 {
         eprintln!("Details in {}", ctx.store.dir().join("rekon.log").display());
     }

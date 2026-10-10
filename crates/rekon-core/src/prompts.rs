@@ -12,6 +12,7 @@ const OVERVIEW: &str = include_str!("../prompts/overview.md");
 const FILES: &str = include_str!("../prompts/files.md");
 const DIRS: &str = include_str!("../prompts/dirs.md");
 const SEGMENT: &str = include_str!("../prompts/segment.md");
+const REVIEW: &str = include_str!("../prompts/review.md");
 
 /// Section markers in the stdin input; the fake backend parses them too.
 pub const FILE_MARKER: &str = "--- file: ";
@@ -69,7 +70,19 @@ pub fn schema(kind: TaskKind) -> Value {
                 "required": ["start", "end", "summary"],
                 "properties": { "start": { "type": "integer" }, "end": { "type": "integer" },
                                 "summary": { "type": "string" } } } } } }),
-        TaskKind::Ontology => crate::ontology::extract::answer_schema(&crate::ontology::schema::Schema::builtin()),
+        TaskKind::Decision
+        | TaskKind::Check
+        | TaskKind::Card
+        | TaskKind::Contract
+        | TaskKind::Impact
+        | TaskKind::Question
+        | TaskKind::Pick
+        | TaskKind::Trace => json!({}),
+        TaskKind::Review => json!({ "type": "object", "required": ["assumed", "now", "points", "effort"],
+            "properties": { "assumed": { "type": "string" }, "now": { "type": "string" },
+                "effort": { "type": "string", "enum": ["skim", "review", "careful"] },
+                "points": { "type": "array", "items": { "type": "object", "required": ["text", "line"],
+                    "properties": { "text": { "type": "string" }, "line": { "type": "integer" } } } } } }),
     }
 }
 
@@ -78,7 +91,15 @@ fn request(config: &Config, system: &str, kind: TaskKind, task: String, input: S
         TaskKind::Overview => &config.models.overview,
         TaskKind::Files | TaskKind::Dirs => &config.models.tree,
         TaskKind::Segment => &config.models.blocks,
-        TaskKind::Ontology => &config.models.ontology,
+        TaskKind::Review
+        | TaskKind::Decision
+        | TaskKind::Check
+        | TaskKind::Card
+        | TaskKind::Contract
+        | TaskKind::Impact
+        | TaskKind::Question
+        | TaskKind::Pick
+        | TaskKind::Trace => &config.models.review,
     };
     LlmRequest {
         kind,
@@ -307,6 +328,28 @@ pub fn segment_request(
         .replace("{start}", &range.0.to_string())
         .replace("{end}", &range.1.to_string());
     request(config, system, TaskKind::Segment, task, input)
+}
+
+/// Section markers of a review request; the fake backend parses them too.
+pub const BEFORE_MARKER: &str = "--- before ---";
+pub const AFTER_MARKER: &str = "--- after ---";
+
+/// Asks how the mental model of one element should change: `before` is the text the
+/// person reviewed, `after` the current lines (`first` is the number of the first one).
+pub fn review_request(
+    config: &Config,
+    system: &str,
+    id: &str,
+    before: &str,
+    after: &[&str],
+    first: u32,
+) -> LlmRequest {
+    let mut input = format!("ELEMENT: {id}\n\n{BEFORE_MARKER}\n{before}\n\n{AFTER_MARKER}\n");
+    for (i, text) in after.iter().enumerate() {
+        input.push_str(&numbered_line(first + i as u32, text));
+        input.push('\n');
+    }
+    request(config, system, TaskKind::Review, REVIEW.trim().to_string(), input)
 }
 
 /// One-line description: newlines become spaces, whitespace collapsed; empty → `None`.

@@ -12,7 +12,7 @@ pub struct Models {
     pub overview: String,
     pub tree: String,
     pub blocks: String,
-    pub ontology: String,
+    pub review: String,
 }
 
 impl Default for Models {
@@ -21,7 +21,7 @@ impl Default for Models {
             overview: "sonnet".into(),
             tree: "haiku".into(),
             blocks: "sonnet".into(),
-            ontology: "sonnet".into(),
+            review: "sonnet".into(),
         }
     }
 }
@@ -33,20 +33,17 @@ pub struct OpenCode {
     pub attach: Option<String>,
 }
 
-/// Which files are mapped onto the ontology and how they are sent to the model.
+/// Which source files the code analyses (relations, questions) look at.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default)]
-pub struct Ontology {
+pub struct Scope {
     /// Globs of files to analyze (full path or file name).
     pub include: Vec<String>,
     /// Globs of files left out (tests by default).
     pub exclude: Vec<String>,
-    /// Lines of code per model call; longer files are split.
-    pub batch_lines: u32,
-    pub batch_max_files: usize,
 }
 
-impl Default for Ontology {
+impl Default for Scope {
     fn default() -> Self {
         let list = |items: &str| items.split_whitespace().map(str::to_string).collect();
         Self {
@@ -62,8 +59,6 @@ impl Default for Ontology {
                 "*_test.py test_*.py *.test.* *.spec.* *Tests.cs *Test.java *.min.js *.lock **/node_modules/** ",
                 "**/vendor/**",
             )),
-            batch_lines: 300,
-            batch_max_files: 8,
         }
     }
 }
@@ -86,8 +81,10 @@ pub struct Config {
     pub batch_max_chars: usize,
     pub exclude: Vec<String>,
     pub editor_cmd: Option<String>,
+    /// Command that runs the tests for `rekon criteria verify` (cargo or dotnet test output).
+    pub test_command: Option<String>,
     pub opencode: OpenCode,
-    pub ontology: Ontology,
+    pub scope: Scope,
 }
 
 impl Default for Config {
@@ -120,8 +117,9 @@ impl Default for Config {
             .map(|s| s.to_string())
             .collect(),
             editor_cmd: None,
+            test_command: None,
             opencode: OpenCode::default(),
-            ontology: Ontology::default(),
+            scope: Scope::default(),
         }
     }
 }
@@ -168,7 +166,6 @@ mod tests {
         assert_eq!(c.models.tree, "x");
         assert_eq!(c.models.blocks, "sonnet");
         assert_eq!(c.max_segment_lines, 1500);
-        assert_eq!(c.models.ontology, "sonnet");
-        assert_eq!(c.ontology.batch_lines, 300);
+        assert!(!c.scope.include.is_empty());
     }
 }

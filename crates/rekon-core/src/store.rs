@@ -102,6 +102,46 @@ impl Store {
         }
     }
 
+    /// Reads a JSON file of the map; a missing or invalid file gives the default.
+    pub fn read_json<T: DeserializeOwned + Default>(&self, path: &Path) -> T {
+        self.read_or_default(path)
+    }
+
+    /// Writes a JSON file of the map under the lock.
+    pub fn write_json<T: Serialize>(&self, path: &Path, value: &T) -> Result<()> {
+        self.locked(|| write_json_atomic(path, value))
+    }
+
+    /// Read-modify-write of a JSON file of the map under the lock.
+    pub fn update_json<T>(&self, path: &Path, f: impl FnOnce(&mut T)) -> Result<()>
+    where
+        T: Serialize + DeserializeOwned + Default,
+    {
+        self.locked(|| {
+            let mut value: T = self.read_or_default(path);
+            f(&mut value);
+            write_json_atomic(path, &value)
+        })
+    }
+
+    /// Stores text under its content hash in `.rekon/objects/` (old versions of code)
+    /// and returns the hash.
+    pub fn put_object(&self, text: &str) -> Result<String> {
+        let key = hash::hash_bytes(text.as_bytes());
+        let path = self.dir.join("objects").join(&key);
+        if !path.exists() {
+            self.locked(|| write_atomic(&path, text.as_bytes()))?;
+        }
+        Ok(key)
+    }
+
+    pub fn object(&self, key: &str) -> Option<String> {
+        if key.is_empty() || !key.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        std::fs::read_to_string(self.dir.join("objects").join(key)).ok()
+    }
+
     fn read_or_default<T: DeserializeOwned + Default>(&self, path: &Path) -> T {
         match std::fs::read_to_string(path) {
             Ok(text) => serde_json::from_str(&text).unwrap_or_else(|e| {

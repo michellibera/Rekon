@@ -39,6 +39,10 @@ pub enum JobKey {
     Level1(String),
     Split(String, (u32, u32)),
     Init,
+    /// Model update of a changed element (its id).
+    Review(String),
+    /// Model job of the insight layer, by its label.
+    Insight(String),
 }
 
 #[derive(Debug)]

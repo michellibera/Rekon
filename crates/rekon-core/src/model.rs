@@ -11,6 +11,53 @@ pub enum Author {
     Agent,
 }
 
+/// Where a fact shown to the user comes from. The UI marks every fact with its origin,
+/// so a guess of the model is never taken for a recorded one.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "lowercase")]
+pub enum Origin {
+    /// Written by the user.
+    Human,
+    /// Produced (or reconstructed) by a model.
+    Ai,
+    /// Read from the code by rekon itself, without a model.
+    Static,
+    /// Observed in a real run.
+    Recorded,
+    /// Result of a test run.
+    TestResult,
+    /// Predicted by a model, not observed.
+    Predicted,
+}
+
+impl Origin {
+    pub fn label(self) -> &'static str {
+        match self {
+            Origin::Human => "human",
+            Origin::Ai => "AI",
+            Origin::Static => "static",
+            Origin::Recorded => "recorded",
+            Origin::TestResult => "test",
+            Origin::Predicted => "predicted",
+        }
+    }
+}
+
+/// A value together with the key (hash) of the element it was made for. It stops being
+/// current when the element changes; the old value may stay as history.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Stamped<T> {
+    pub hash: String,
+    pub origin: Origin,
+    pub value: T,
+}
+
+impl<T> Stamped<T> {
+    pub fn is_current(&self, key: &str) -> bool {
+        self.hash == key
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Summary {
     pub hash: String,
@@ -191,5 +238,27 @@ mod tests {
         assert_eq!(freshness(Some(&s), Some("a")), Freshness::Fresh);
         assert_eq!(freshness(Some(&s), Some("b")), Freshness::Stale);
         assert_eq!(freshness(Some(&s), None), Freshness::Fresh);
+    }
+}
+
+/// Lines of code that back a statement, shown in the code panel.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Evidence {
+    /// Repository path with `/` separators.
+    pub file: String,
+    /// 1-based, inclusive.
+    pub start_line: u32,
+    pub end_line: u32,
+    pub symbol: Option<String>,
+    pub reason: String,
+}
+
+impl Evidence {
+    pub fn location(&self) -> String {
+        if self.start_line == self.end_line {
+            format!("{}:{}", self.file, self.start_line)
+        } else {
+            format!("{}:{}-{}", self.file, self.start_line, self.end_line)
+        }
     }
 }

@@ -145,6 +145,27 @@ fn session_start_prints_overview_and_two_levels() {
 }
 
 #[test]
+fn session_start_lists_decisions_and_specs_only_when_there_are_some() {
+    let dir = repo();
+    let root = dir.path();
+    let (ctx, _fake) = ctx(root);
+    init::run(&ctx, &Options::default(), &|_| {}).unwrap();
+    let plain = context::session_start_hook(&hook_input(root, false), "rekon").unwrap().unwrap();
+    assert!(!plain.contains("Decisions and specifications"), "{plain}");
+
+    let mut d = rekon_core::decisions::Decision::new("Queue", "Send mail through a queue");
+    d.revisit_if = "Instant answers are needed".into();
+    d.elements = vec!["src/api/orders.rs".into()];
+    rekon_core::decisions::add(&ctx, d).unwrap();
+    let spec = rekon_core::cards::Card::spec("Retry payments", "Fails at once", "Retries three times");
+    let spec = rekon_core::cards::add(&ctx, spec).unwrap();
+    let out = context::session_start_hook(&hook_input(root, false), "rekon").unwrap().unwrap();
+    assert!(out.contains("Send mail through a queue") && out.contains("Instant answers are needed"), "{out}");
+    assert!(out.contains(&spec.id) && out.contains("card brief"), "{out}");
+    assert!(out.contains("rekon decision add"), "{out}");
+}
+
+#[test]
 fn automatic_result_does_not_overwrite_agent_written_meanwhile() {
     let dir = repo();
     let root = dir.path().to_path_buf();

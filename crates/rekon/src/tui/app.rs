@@ -13,17 +13,18 @@ use ratatui::text::Line;
 use rekon_core::Ctx;
 use rekon_core::init::{self, Options, Progress};
 use rekon_core::jobs::{JobDone, JobKey, JobPool};
-use rekon_core::model::{Blocks, DirNote, FileNote, Freshness, ProjectNote, freshness};
-use rekon_core::ontology::graph::GraphIndex;
-use rekon_core::ontology::index::{self as ontology, Progress as OntologyProgress};
-use rekon_core::ontology::model::{Edge, Evidence};
+use rekon_core::model::{Blocks, DirNote, Evidence, FileNote, Freshness, ProjectNote, freshness};
+use rekon_core::review::{self, Change};
 use rekon_core::scan::{Excluder, Tree};
 use rekon_core::{segment, text};
 
 use super::editor::EditRequest;
-use super::graph::{Click, Dir, Explorer, Sel};
 use super::highlight::{self, Lines};
 use super::rows::{self, BlockView, Desc, Row, RowKind, RowRef};
+
+mod insight;
+
+pub use insight::{Detail, Insight};
 
 const TICK: Duration = Duration::from_secs(2);
 const RESCAN: Duration = Duration::from_secs(15);
@@ -34,8 +35,6 @@ pub enum Bg {
     Analyzed(Tree),
     InitProgress(Progress),
     InitDone(Result<String, String>),
-    OntologyProgress(OntologyProgress),
-    OntologyDone(Result<String, String>),
     Highlighted {
         path: String,
         hash: String,
@@ -53,13 +52,23 @@ pub enum Focus {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum View {
     Tree,
-    Ontology,
+    /// What changed since the user's review.
+    Changes,
+    /// Decisions: why things are the way they are.
+    Decisions,
+    /// Behaviour-change cards.
+    Cards,
+    /// Progress as met criteria.
+    Criteria,
+    /// Pinned questions and their answers.
+    Ask,
 }
 
-/// Evidence of the element selected in the graph, shown in the code panel.
+/// Evidence of the selected change, shown in the code panel.
 pub struct EvidenceNav {
-    pub sel: Sel,
-    /// What the evidence proves, e.g. `Store —writes→ notes`.
+    /// Id of the change shown.
+    pub sel: String,
+    /// What the evidence proves.
     pub title: String,
     pub items: Vec<Evidence>,
     pub index: usize,
@@ -75,8 +84,10 @@ impl EvidenceNav {
 pub enum Popup {
     Overview(u16),
     Help,
-    /// Filters of the graph, with the cursor on this entry.
-    Filter(usize),
+    /// A text window (a brief, a result), scrolled by this many lines.
+    Text(u16),
+    /// One-line input (a question, an expectation).
+    Input,
 }
 
 pub struct OpenFile {
@@ -233,12 +244,15 @@ pub struct App {
     pub expanded_blocks: HashSet<(String, (u32, u32))>,
     pub focus: Focus,
     pub wide: bool,
-    /// What the left panel shows: the tree or the ontology graph.
+    /// What the left panel shows.
     pub view: View,
-    pub explorer: Explorer,
     pub evidence: Option<EvidenceNav>,
-    /// Ontology analysis running in the background.
-    pub ontology: Option<OntologyProgress>,
+    /// Insight layer: subject, inspector tabs, lenses, history, pins.
+    pub ins: Insight,
+    insight_tx: Sender<(String, Option<(String, String)>)>,
+    insight_rx: Receiver<(String, Option<(String, String)>)>,
+    /// Changes since the user's review, for the changes view.
+    pub changes: Vec<Change>,
     /// Tabs of the left panel in the last frame, for clicks.
     pub tabs: Vec<(Rect, View)>,
     /// One-time message for the status line, cleared by the next key.
@@ -287,9 +301,10 @@ impl App {
     pub fn with_tree(ctx: Arc<Ctx>, tree: Tree) -> anyhow::Result<Self> {
         let (bg_tx, bg_rx) = channel();
         let (done_tx, done_rx) = channel();
+        let (insight_tx, insight_rx) = channel();
         let excluder = Excluder::new(&ctx.config.exclude)?;
         let pool = JobPool::new(ctx.config.workers, done_tx);
-        Ok(Self {
+        let mut app = Self {
             ctx,
             tree,
             notes: Notes::default(),
@@ -298,9 +313,11 @@ impl App {
             focus: Focus::Tree,
             wide: false,
             view: View::Tree,
-            explorer: Explorer::default(),
             evidence: None,
-            ontology: None,
+            ins: Insight::default(),
+            insight_tx,
+            insight_rx,
+            changes: Vec::new(),
             tabs: Vec::new(),
             notice: None,
             desc_only: false,
@@ -333,7 +350,10 @@ impl App {
             editor_request: None,
             quit: false,
             dirty: true,
-        })
+        };
+        app.refresh_insight();
+        app.refresh_changes();
+        Ok(app)
     }
 
     pub fn repo_name(&self) -> String {
@@ -388,44 +408,26 @@ impl App {
         });
     }
 
-    /// Runs the ontology analysis in the background: files changed since the last
-    /// run, or `paths` again with `force`.
-    fn start_ontology(&mut self, paths: Option<Vec<String>>, force: bool) {
-        if self.ontology.is_some() {
-            return;
-        }
-        if let Err(e) = init::prepare(&self.ctx.root) {
-            self.error(format!("ontology: {e:#}"));
-            return;
-        }
-        self.ontology = Some(OntologyProgress::default());
-        let ctx = Arc::clone(&self.ctx);
-        let tx = self.bg_tx.clone();
-        std::thread::spawn(move || {
-            let progress_tx = std::sync::Mutex::new(tx.clone());
-            let on_progress = |p: &OntologyProgress| {
-                let _ = progress_tx.lock().map(|t| t.send(Bg::OntologyProgress(p.clone())));
-            };
-            let opts = ontology::Options {
-                force,
-                paths,
-                dry_run: false,
-            };
-            let result = ontology::run(&ctx, &opts, &on_progress)
-                .map(|r| text::ontology_done(r.analyzed, r.nodes, r.edges, r.errors))
-                .map_err(|e| format!("ontology: {e:#}"));
-            let _ = tx.send(Bg::OntologyDone(result));
-        });
-    }
-
-    /// Switches the left panel between the tree and the ontology graph.
+    /// Switches the left panel between its views.
     pub fn set_view(&mut self, view: View) {
-        self.view = view;
-        if view == View::Ontology {
-            if self.explorer.area.width == 0 {
-                self.explorer.area = self.tree_panel.area;
+        if view != View::Tree {
+            self.refresh_insight();
+        }
+        if view != self.view {
+            self.tree_sel_key = None;
+            self.tree_panel.sel = 0;
+            self.tree_panel.offset = 0;
+            if self.view == View::Changes {
+                self.evidence = None;
             }
-            self.explorer.load(self.ctx.store.dir());
+        }
+        self.view = view;
+        if view == View::Changes {
+            self.refresh_changes();
+            self.show_selected_change();
+        }
+        if matches!(view, View::Decisions | View::Cards | View::Criteria | View::Ask) {
+            self.evidence = None;
         }
     }
 
@@ -458,15 +460,6 @@ impl App {
                         self.error(e);
                     }
                 }
-                Bg::OntologyProgress(p) => self.ontology = Some(p),
-                Bg::OntologyDone(result) => {
-                    self.ontology = None;
-                    self.explorer.load(self.ctx.store.dir());
-                    match result {
-                        Ok(m) => self.notice = Some(m),
-                        Err(e) => self.error(e),
-                    }
-                }
                 Bg::Highlighted { path, hash, lines } => {
                     let lines = lines.map(Arc::new);
                     if let Some(l) = &lines {
@@ -481,12 +474,17 @@ impl App {
                 }
             }
         }
+        while let Ok((label, shown)) = self.insight_rx.try_recv() {
+            self.insight_done(label, shown);
+        }
         while let Ok(done) = self.done_rx.try_recv() {
             self.dirty = true;
             match &done.key {
                 JobKey::FileSummary(p) | JobKey::Level1(p) | JobKey::Split(p, _) => self.notes.forget_file(p),
                 JobKey::DirSummary(p) => self.notes.forget_dir(p),
                 JobKey::Init => self.notes.clear(),
+                JobKey::Review(_) => self.refresh_changes(),
+                JobKey::Insight(_) => self.refresh_insight(),
             }
             if let Err(e) = done.result {
                 self.error(e);
@@ -502,11 +500,11 @@ impl App {
         }
     }
 
-    /// Every 2 s: re-stat visible files and the open file, reload changed notes (and
-    /// the ontology graph, when it changed on disk).
+    /// Every 2 s: re-stat visible files and the open file, reload changed notes.
     pub fn tick(&mut self) {
-        if self.view == View::Ontology && self.explorer.load(self.ctx.store.dir()) {
-            self.dirty = true;
+        self.refresh_changes();
+        if self.view != View::Tree || self.ins.detail != Detail::Code {
+            self.refresh_insight();
         }
         let (start, end) = (
             self.tree_panel.offset,
@@ -628,15 +626,29 @@ impl App {
 
     /// Rebuilds the rows of both panels for the given inner widths.
     pub fn rebuild(&mut self, tree_width: usize, code_width: usize) {
-        let visible = rows::visible_nodes(&self.tree, &self.expanded);
-        let mut out = Vec::with_capacity(visible.len());
-        for (i, depth) in visible {
-            let desc = self.desc(i);
-            let expanded = self.expanded.contains(&self.tree.node(i).path);
-            out.push(rows::tree_row(&self.tree, i, depth, expanded, &desc, tree_width));
+        let mut out = Vec::new();
+        if self.view == View::Changes {
+            out.extend(self.changes.iter().map(|c| super::changes::row(c, tree_width)));
+            if out.is_empty() {
+                out.push(super::changes::message_row(text::NO_CHANGES));
+            }
+        } else if matches!(self.view, View::Decisions | View::Cards | View::Criteria | View::Ask) {
+            out = self.lens_rows(tree_width);
+        } else {
+            let visible = rows::visible_nodes(&self.tree, &self.expanded);
+            for (i, depth) in visible {
+                let desc = self.desc(i);
+                let expanded = self.expanded.contains(&self.tree.node(i).path);
+                out.push(rows::tree_row(&self.tree, i, depth, expanded, &desc, tree_width));
+            }
         }
         self.tree_rows = out;
         self.tree_panel.sel = restore(&self.tree_rows, &self.tree_sel_key, self.tree_panel.sel);
+        if self.view == View::Changes {
+            self.sync_change_evidence();
+        } else if matches!(self.view, View::Decisions | View::Cards | View::Criteria | View::Ask) && self.evidence.is_none() {
+            self.show_lens_selection();
+        }
         self.code_rows = self.build_code_rows(code_width);
         let mut sel = restore(&self.code_rows, &self.code_sel_key, self.code_panel.sel);
         if self.has_headers() && self.code_rows.get(sel).is_some_and(|r| r.kind != RowKind::BlockHeader) {
@@ -648,6 +660,10 @@ impl App {
                 .unwrap_or(0);
         }
         self.code_panel.sel = sel;
+        self.sync_subject();
+        if self.ins.detail != Detail::Code {
+            self.build_inspector(code_width);
+        }
     }
 
     fn build_code_rows(&mut self, width: usize) -> Vec<Row> {
@@ -709,6 +725,9 @@ impl App {
             self.quit = true;
             return;
         }
+        if self.popup == Some(Popup::Input) {
+            return self.input_key(key);
+        }
         if let Some(popup) = self.popup {
             match (popup, key.code) {
                 (_, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') | KeyCode::Char('i')) => self.popup = None,
@@ -716,33 +735,26 @@ impl App {
                 (Popup::Overview(s), KeyCode::Up | KeyCode::Char('k')) => {
                     self.popup = Some(Popup::Overview(s.saturating_sub(1)))
                 }
-                (Popup::Filter(_), KeyCode::Char('f')) => self.popup = None,
-                (Popup::Filter(i), KeyCode::Down | KeyCode::Char('j')) => {
-                    let last = self.explorer.filter_entries().len().saturating_sub(1);
-                    self.popup = Some(Popup::Filter((i + 1).min(last)))
-                }
-                (Popup::Filter(i), KeyCode::Up | KeyCode::Char('k')) => {
-                    self.popup = Some(Popup::Filter(i.saturating_sub(1)))
-                }
-                (Popup::Filter(i), KeyCode::Char(' ') | KeyCode::Enter) => {
-                    if let Some((f, _)) = self.explorer.filter_entries().into_iter().nth(i)
-                        && !self.explorer.toggle_filter(f)
-                    {
-                        self.notice = Some(text::reveal_stopped(super::graph::REVEAL_MAX));
-                    }
-                }
+                (Popup::Text(s), KeyCode::Down | KeyCode::Char('j')) => self.popup = Some(Popup::Text(s + 1)),
+                (Popup::Text(s), KeyCode::Up | KeyCode::Char('k')) => self.popup = Some(Popup::Text(s.saturating_sub(1))),
                 _ => {}
             }
             return;
         }
         match key.code {
             KeyCode::Char('1') => return self.set_view(View::Tree),
-            KeyCode::Char('2') => return self.set_view(View::Ontology),
+            KeyCode::Char('2') => return self.set_view(View::Changes),
             KeyCode::Char('[') => return self.evidence_step(-1),
             KeyCode::Char(']') => return self.evidence_step(1),
             _ => {}
         }
-        if self.view == View::Ontology && self.focus == Focus::Tree && self.graph_key(key) {
+        if self.insight_global_key(key) {
+            return;
+        }
+        if self.focus == Focus::Tree && self.lens_key(key) {
+            return;
+        }
+        if self.focus == Focus::Code && self.ins.detail != Detail::Code && self.inspector_key(key) {
             return;
         }
         let page = match self.focus {
@@ -761,6 +773,9 @@ impl App {
                 }
             }
             KeyCode::Char('o') => self.desc_only = !self.desc_only,
+            KeyCode::Char('r') if self.view == View::Changes => self.refresh_changes(),
+            KeyCode::Char('m') => self.mark_understood(),
+            KeyCode::Char('u') if self.view == View::Changes => self.request_update(),
             KeyCode::Char('r') => self.regenerate(),
             KeyCode::Char('R') => self.start_init(),
             KeyCode::Char('e') => self.request_editor(),
@@ -781,99 +796,6 @@ impl App {
             KeyCode::Left | KeyCode::Char('h') => self.back(),
             _ => {}
         }
-    }
-
-    /// Keys of the graph panel; false for keys left to the common handling.
-    fn graph_key(&mut self, key: KeyEvent) -> bool {
-        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
-        let half = i32::from(self.explorer.area.height / 2).max(1);
-        match key.code {
-            KeyCode::Up if shift => self.explorer.pan(0, -3),
-            KeyCode::Down if shift => self.explorer.pan(0, 3),
-            KeyCode::Left if shift => self.explorer.pan(-8, 0),
-            KeyCode::Right if shift => self.explorer.pan(8, 0),
-            KeyCode::Up | KeyCode::Char('k') => self.explorer.go(Dir::Up),
-            KeyCode::Down | KeyCode::Char('j') => self.explorer.go(Dir::Down),
-            KeyCode::Left | KeyCode::Char('h') => self.explorer.go(Dir::Left),
-            KeyCode::Right | KeyCode::Char('l') => self.explorer.go(Dir::Right),
-            KeyCode::Char(' ') => self.explorer.toggle(),
-            KeyCode::Backspace => self.explorer.collapse_selected(),
-            KeyCode::Esc => self.explorer.up_level(),
-            KeyCode::Enter => self.show_evidence(),
-            KeyCode::Char('+') | KeyCode::Char('=') => self.explorer.zoom_step(1, None),
-            KeyCode::Char('-') => self.explorer.zoom_step(-1, None),
-            KeyCode::Char('0') => self.explorer.zoom_to(1.0, None),
-            KeyCode::Char('c') => self.explorer.center = Some(0.33),
-            KeyCode::Home => self.explorer.select_root(),
-            KeyCode::PageUp => self.explorer.pan(0, -half),
-            KeyCode::PageDown => self.explorer.pan(0, half),
-            KeyCode::Char('L') => {
-                if self.explorer.lineage() == 0 {
-                    self.notice = Some(text::NO_LINEAGE.into());
-                }
-            }
-            KeyCode::Char('f') => self.popup = Some(Popup::Filter(0)),
-            KeyCode::Char('R') => self.start_ontology(None, false),
-            KeyCode::Char('r') => {
-                let files = self.selection_files();
-                if !files.is_empty() {
-                    self.start_ontology(Some(files), true);
-                }
-            }
-            _ => return false,
-        }
-        true
-    }
-
-    /// Files of the evidence of the element selected in the graph.
-    fn selection_files(&self) -> Vec<String> {
-        let (Some(g), Some(sel)) = (&self.explorer.graph, &self.explorer.sel) else {
-            return Vec::new();
-        };
-        let evidence = match sel {
-            Sel::Node(id) => g.node(id).map(|n| &n.evidence),
-            Sel::Edge(id) => g.edge(id).map(|e| &e.evidence),
-            Sel::More(_) | Sel::Group(..) => None,
-        };
-        let mut files: Vec<String> = evidence.into_iter().flatten().map(|e| e.file.clone()).collect();
-        files.sort();
-        files.dedup();
-        files
-    }
-
-    /// Enter in the graph: the evidence of the selected element in the code panel;
-    /// again on the same element, its next evidence.
-    fn show_evidence(&mut self) {
-        let Some(sel) = self.explorer.sel.clone() else { return };
-        if let Some(ev) = self.evidence.as_mut().filter(|ev| ev.sel == sel) {
-            ev.index = (ev.index + 1) % ev.items.len();
-            self.open_evidence();
-            return;
-        }
-        let Some(g) = self.explorer.graph.clone() else { return };
-        let (title, items) = match &sel {
-            Sel::Node(id) => match g.node(id) {
-                Some(n) => (format!("{} · {}", n.kind, n.name), n.evidence.clone()),
-                None => return,
-            },
-            Sel::Edge(id) => match g.edge(id) {
-                Some(e) => (edge_title(&g, e), e.evidence.clone()),
-                None => return,
-            },
-            Sel::More(id) => return self.explorer.show_more(&id.clone()),
-            Sel::Group(id, label) => return self.explorer.open_group(&id.clone(), &label.clone()),
-        };
-        if items.is_empty() {
-            self.notice = Some(text::NO_EVIDENCE.into());
-            return;
-        }
-        self.evidence = Some(EvidenceNav {
-            sel,
-            title,
-            items,
-            index: 0,
-        });
-        self.open_evidence();
     }
 
     /// `[` / `]`: previous or next evidence of the element shown.
@@ -942,6 +864,11 @@ impl App {
         panel.sel = target;
         panel.follow = true;
         *key = Some(rows[target].target.clone());
+        if self.view == View::Changes && self.focus == Focus::Tree {
+            self.show_selected_change();
+        } else if matches!(self.view, View::Decisions | View::Cards | View::Criteria | View::Ask) && self.focus == Focus::Tree {
+            self.show_lens_selection();
+        }
     }
 
     fn activate(&mut self, focus_code: bool) {
@@ -955,6 +882,17 @@ impl App {
             return;
         };
         let RowRef::Node(path) = &row.target else { return };
+        if self.view == View::Changes || matches!(self.view, View::Decisions | View::Cards | View::Criteria | View::Ask) {
+            if self.view == View::Changes {
+                self.show_selected_change();
+            } else {
+                self.show_lens_selection();
+            }
+            if focus_code && !self.wide {
+                self.focus = Focus::Code;
+            }
+            return;
+        }
         match row.kind {
             RowKind::Dir => {
                 if !self.expanded.insert(path.clone()) {
@@ -1064,9 +1002,10 @@ impl App {
             self.dirty = true;
             return;
         }
-        let in_graph = self.explorer.area.contains((x, y).into());
-        if self.view == View::Ontology && (self.explorer.dragging() || in_graph) {
-            self.graph_mouse(m);
+        if m.kind == MouseEventKind::Down(MouseButton::Left)
+            && let Some(&(_, d)) = self.ins.tabs.iter().find(|(r, _)| r.contains((x, y).into()))
+        {
+            self.set_detail(d);
             return;
         }
         let focus = if self.tree_panel.contains(x, y) {
@@ -1104,29 +1043,6 @@ impl App {
         }
     }
 
-    /// Mouse in the graph: click selects, double click expands (a node) or shows the
-    /// evidence (an edge), dragging moves a node or the view, the wheel zooms.
-    fn graph_mouse(&mut self, m: MouseEvent) {
-        let (x, y) = (m.column, m.row);
-        match m.kind {
-            MouseEventKind::Down(MouseButton::Left) => {
-                self.focus = Focus::Tree;
-                match self.explorer.press(x, y) {
-                    Some(Click::Double(Sel::Node(_))) => self.explorer.toggle(),
-                    Some(Click::Double(Sel::More(id))) => self.explorer.show_more(&id),
-                    Some(Click::Double(Sel::Edge(_))) => self.show_evidence(),
-                    _ => {}
-                }
-            }
-            MouseEventKind::Drag(MouseButton::Left) => self.explorer.drag_to(x, y),
-            MouseEventKind::Up(MouseButton::Left) => self.explorer.release(),
-            MouseEventKind::ScrollUp => self.explorer.zoom_step(1, Some((x, y))),
-            MouseEventKind::ScrollDown => self.explorer.zoom_step(-1, Some((x, y))),
-            _ => return,
-        }
-        self.dirty = true;
-    }
-
     /// Click on row `index` of the focused panel: select, then expand/collapse or open.
     pub fn click(&mut self, index: usize) {
         match self.focus {
@@ -1137,6 +1053,14 @@ impl App {
                 self.tree_panel.sel = index;
                 self.tree_sel_key = Some(row.target.clone());
                 let RowRef::Node(path) = &row.target else { return };
+                if self.view == View::Changes {
+                    self.show_selected_change();
+                    return;
+                }
+                if matches!(self.view, View::Decisions | View::Cards | View::Criteria | View::Ask) {
+                    self.show_lens_selection();
+                    return;
+                }
                 match row.kind {
                     RowKind::Dir => {
                         if !self.expanded.remove(path) {
@@ -1167,6 +1091,113 @@ impl App {
                     self.code_sel_key = Some(self.code_rows[i].target.clone());
                 }
             }
+        }
+    }
+
+    // ----- changes since the review -----
+
+    fn selected_change(&self) -> Option<&Change> {
+        let RowRef::Node(id) = &self.tree_rows.get(self.tree_panel.sel)?.target else {
+            return None;
+        };
+        self.changes.iter().find(|c| &c.id == id)
+    }
+
+    /// Recomputes the changes against the baseline; redraws only when they differ.
+    pub fn refresh_changes(&mut self) {
+        match review::changes(&self.ctx) {
+            Ok(list) if list != self.changes => {
+                self.changes = list;
+                self.dirty = true;
+            }
+            Ok(_) => {}
+            Err(e) => self.error(format!("review: {e:#}")),
+        }
+    }
+
+    /// Keeps the code panel on the selected change when the list changed under it.
+    fn sync_change_evidence(&mut self) {
+        let want = self.selected_change().map(|c| c.id.clone());
+        let have = self.evidence.as_ref().map(|e| e.sel.clone());
+        if want != have {
+            self.show_selected_change();
+        }
+    }
+
+    /// Shows the selected change in the code panel, with its lines highlighted.
+    fn show_selected_change(&mut self) {
+        let Some(c) = self.selected_change().cloned() else {
+            self.evidence = None;
+            return;
+        };
+        if c.start == 0 {
+            self.evidence = None;
+            return;
+        }
+        self.evidence = Some(EvidenceNav {
+            sel: c.id.clone(),
+            title: c.status.label().to_string(),
+            items: vec![Evidence {
+                file: c.path.clone(),
+                start_line: c.start,
+                end_line: c.end,
+                symbol: Some(c.name.clone()),
+                reason: c.status.label().to_string(),
+            }],
+            index: 0,
+        });
+        self.open_evidence();
+    }
+
+    /// `m`: in the tree the selected file or folder (or, in the code panel, the open file)
+    /// becomes the reviewed version; in the changes view the selected change is accepted.
+    fn mark_understood(&mut self) {
+        if self.view == View::Changes {
+            let Some(c) = self.selected_change().cloned() else { return };
+            match review::accept(&self.ctx, &c) {
+                Ok(()) => self.notice = Some(text::accepted(&c.name)),
+                Err(e) => self.error(format!("review: {e:#}")),
+            }
+            self.refresh_changes();
+            self.show_selected_change();
+            return;
+        }
+        let paths: Vec<String> = match (self.focus, &self.open, self.selected_tree_path()) {
+            (Focus::Code, Some(open), _) => vec![open.path.clone()],
+            (_, _, Some(p)) => {
+                let Some(i) = self.tree.get(p) else { return };
+                if self.tree.node(i).is_dir {
+                    let prefix = p.to_string();
+                    self.tree
+                        .subtree(&prefix)
+                        .into_iter()
+                        .filter(|&j| !self.tree.node(j).is_dir)
+                        .filter(|&j| self.tree.node(j).file.as_ref().is_some_and(|f| f.is_text()))
+                        .map(|j| self.tree.node(j).path.clone())
+                        .collect()
+                } else {
+                    vec![p.to_string()]
+                }
+            }
+            _ => return,
+        };
+        let (mut elements, mut errors) = (0, 0);
+        for p in &paths {
+            match review::mark_file(&self.ctx, p) {
+                Ok(n) => elements += n,
+                Err(_) => errors += 1,
+            }
+        }
+        self.notice = Some(text::marked(paths.len() - errors, elements));
+    }
+
+    /// `u`: asks the model for the update of the mental model of the selected change.
+    fn request_update(&mut self) {
+        let Some(c) = self.selected_change().cloned() else { return };
+        let ctx = Arc::clone(&self.ctx);
+        let key = JobKey::Review(c.id.clone());
+        if self.pool.submit(key, move || review::update(&ctx, &c).map(|_| ())) {
+            self.notice = Some(text::UPDATE_ASKED.to_string());
         }
     }
 
@@ -1252,10 +1283,6 @@ impl App {
             _ => None,
         };
         let (path, line) = match (self.focus, &self.open) {
-            (Focus::Tree, _) if self.view == View::Ontology => match &self.evidence {
-                Some(ev) => (ev.current().file.clone(), ev.current().start_line),
-                None => return,
-            },
             (Focus::Code, Some(open)) => (
                 open.path.clone(),
                 self.selected_block().map(|r| r.0).or(selected_line).unwrap_or(1),
@@ -1272,6 +1299,7 @@ impl App {
             abs,
             line,
             hash_before,
+            followup: None,
         });
     }
 
@@ -1279,8 +1307,16 @@ impl App {
     /// split it again right away.
     pub fn after_edit(&mut self, req: EditRequest, result: anyhow::Result<()>) {
         self.dirty = true;
-        if let Err(e) = result {
+        if let Err(e) = &result {
             self.error(format!("editor: {e:#}"));
+        }
+        if let Some(followup) = req.followup.clone() {
+            if result.is_ok() {
+                self.finish_template(&req, followup);
+            } else {
+                let _ = std::fs::remove_file(&req.abs);
+            }
+            return;
         }
         if let Some(i) = self.tree.get(&req.path) {
             self.tree
@@ -1372,8 +1408,17 @@ impl App {
 
     /// Full description of the selected item, for the footer.
     pub fn selected_description(&mut self) -> String {
-        if self.view == View::Ontology && self.focus == Focus::Tree {
-            return self.graph_description();
+        if matches!(self.view, View::Decisions | View::Cards | View::Criteria | View::Ask) && self.focus == Focus::Tree {
+            return self.lens_description();
+        }
+        if self.view == View::Changes && self.focus == Focus::Tree {
+            return match self.selected_change().cloned() {
+                Some(c) => {
+                    let update = review::cached_update(&self.ctx.store, &c);
+                    super::changes::description(&c, update.as_ref())
+                }
+                None => String::new(),
+            };
         }
         if self.focus == Focus::Code
             && let Some(open) = &self.open
@@ -1412,42 +1457,9 @@ impl App {
         format!("{shown} — {desc}")
     }
 
-    fn graph_description(&self) -> String {
-        let (Some(g), Some(sel)) = (&self.explorer.graph, &self.explorer.sel) else {
-            return String::new();
-        };
-        match sel {
-            Sel::Node(id) => g.node(id).map_or_else(String::new, |n| {
-                let description = n.description.as_deref().unwrap_or(text::NO_DESCRIPTION);
-                text::node_line(&n.kind, &n.name, description, n.confidence, n.evidence.len(), &n.id)
-            }),
-            Sel::Edge(id) => g.edge(id).map_or_else(String::new, |e| {
-                text::edge_line(&edge_title(g, e), e.confidence, e.evidence.len())
-            }),
-            Sel::More(id) => {
-                let count = self.explorer.more.get(id).map_or(0, |m| m.count);
-                text::more_line(count, g.node(id).map_or("", |n| n.name.as_str()))
-            }
-            Sel::Group(id, label) => {
-                let count = self
-                    .explorer
-                    .groups
-                    .get(&(id.clone(), label.clone()))
-                    .map_or(0, |m| m.count);
-                text::group_line(label, count, g.node(id).map_or("", |n| n.name.as_str()))
-            }
-        }
-    }
-
     pub fn jobs_running(&self) -> usize {
-        self.pool.pending_count() + usize::from(self.init.is_some()) + usize::from(self.ontology.is_some())
+        self.pool.pending_count() + usize::from(self.init.is_some())
     }
-}
-
-/// `source —relation→ target` with node names.
-fn edge_title(g: &GraphIndex, e: &Edge) -> String {
-    let name = |id: &str| g.node(id).map_or_else(|| id.to_string(), |n| n.name.clone());
-    format!("{} —{}→ {}", name(&e.source), e.relation, name(&e.target))
 }
 
 fn to_desc(text: Option<String>, f: Freshness, pending: bool) -> Desc {

@@ -518,6 +518,7 @@ fn edit_that_changes_the_file_redescribes_and_resplits_it() {
         path: "src/main.rs".into(),
         abs: abs.clone(),
         line: 1,
+        followup: None,
         hash_before: rekon_core::hash::hash_file(&abs).ok(),
     };
     std::fs::write(
@@ -546,6 +547,7 @@ fn edit_without_changes_calls_nothing() {
         path: "src/main.rs".into(),
         abs: abs.clone(),
         line: 1,
+        followup: None,
         hash_before: rekon_core::hash::hash_file(&abs).ok(),
     };
     fx.app.after_edit(req, Ok(()));
@@ -604,4 +606,62 @@ fn r_in_tree_regenerates_the_selected_description() {
     fx.wait_jobs();
     assert!(fx.tree_lines().contains(&"▾ src/  Opis testowy: src".to_string()));
     assert_eq!(fx.app.errors, 0, "{:?}", fx.app.last_error);
+}
+
+
+#[test]
+fn changes_view_lists_what_changed_since_marking_and_accepts_it() {
+    use super::app::View;
+    let mut fx = fixture(120, 30);
+    fx.app.expanded.insert("src".into());
+    fx.draw();
+    fx.key(KeyCode::Down); // src/lib.rs
+    fx.draw();
+    fx.app.expanded.insert("src".into());
+    let ctx = fx.app.ctx.clone();
+    rekon_core::review::mark_file(&ctx, "src/main.rs").unwrap();
+    fx.key(KeyCode::Char('2'));
+    let screen = fx.draw().join("
+");
+    assert_eq!(fx.app.view, View::Changes);
+    assert!(screen.contains("Nothing changed since your review"), "{screen}");
+
+    write(fx.dir.path(), "src/main.rs", "fn main() {
+    run();
+}
+
+fn run() {
+    go();
+}
+");
+    fx.key(KeyCode::Char('r'));
+    let screen = fx.draw().join("
+");
+    assert!(screen.contains("~ run"), "{screen}");
+    assert!(fx.app.evidence.is_some(), "the change is shown in the code panel");
+    assert!(fx.app.selected_description().contains("changed"));
+
+    fx.key(KeyCode::Char('u'));
+    fx.wait_jobs();
+    assert!(fx.app.selected_description().contains("[AI, review]"), "{}", fx.app.selected_description());
+    assert_eq!(fx.app.errors, 0, "{:?}", fx.app.last_error);
+
+    fx.key(KeyCode::Char('m'));
+    let screen = fx.draw().join("
+");
+    assert!(screen.contains("Nothing changed since your review"), "{screen}");
+}
+
+#[test]
+fn m_in_the_tree_marks_the_selected_file() {
+    let mut fx = fixture(100, 24);
+    fx.app.expanded.insert("src".into());
+    fx.draw();
+    fx.key(KeyCode::Down);
+    fx.key(KeyCode::Down); // src/main.rs? check below
+    fx.draw();
+    let path = fx.app.selected_tree_path().unwrap().to_string();
+    fx.key(KeyCode::Char('m'));
+    let baseline = rekon_core::review::load(&fx.app.ctx.store);
+    assert!(baseline.items.values().any(|r| r.path == path), "{path}: {baseline:?}");
 }

@@ -17,7 +17,15 @@ pub enum TaskKind {
     Files,
     Dirs,
     Segment,
-    Ontology,
+    Review,
+    Decision,
+    Check,
+    Card,
+    Contract,
+    Impact,
+    Question,
+    Pick,
+    Trace,
 }
 
 impl TaskKind {
@@ -27,7 +35,15 @@ impl TaskKind {
             TaskKind::Files => "files",
             TaskKind::Dirs => "dirs",
             TaskKind::Segment => "segment",
-            TaskKind::Ontology => "ontology",
+            TaskKind::Review => "review",
+            TaskKind::Decision => "decision",
+            TaskKind::Check => "check",
+            TaskKind::Card => "card",
+            TaskKind::Contract => "contract",
+            TaskKind::Impact => "impact",
+            TaskKind::Question => "question",
+            TaskKind::Pick => "pick",
+            TaskKind::Trace => "trace",
         }
     }
 }

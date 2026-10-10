@@ -7,17 +7,14 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use rekon_core::text;
 
-use super::app::{App, Focus, Popup, View};
-use super::graph::{self, Filter};
-use super::rows::{self, DIM, Row, RowRef};
+use super::app::{App, Detail, Focus, Popup, View};
+use super::rows::{self, DIM, Row, RowRef, WARN};
 
 const TREE_PERCENT: u16 = 45;
-/// The graph needs more room than the tree.
-const GRAPH_PERCENT: u16 = 55;
 const FOCUS_BORDER: Style = Style::new().fg(Color::Cyan);
 const SEL_FOCUSED: Style = Style::new().bg(Color::Rgb(26, 50, 74));
 const SEL_UNFOCUSED: Style = Style::new().bg(Color::Rgb(46, 48, 54));
-/// Lines of the evidence shown for a graph element.
+/// Lines of the evidence shown for a change.
 const EVIDENCE: Style = Style::new().bg(Color::Rgb(66, 56, 18));
 const TAB_ACTIVE: Style = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
 
@@ -28,30 +25,21 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let (tree_area, code_area) = if app.wide {
         (body, Rect::default())
     } else {
-        let percent = if app.view == View::Ontology {
-            GRAPH_PERCENT
-        } else {
-            TREE_PERCENT
-        };
-        let [t, c] = Layout::horizontal([Constraint::Percentage(percent), Constraint::Min(10)]).areas(body);
+        let [t, c] = Layout::horizontal([Constraint::Percentage(TREE_PERCENT), Constraint::Min(10)]).areas(body);
         (t, c)
     };
     let (tree_block, tabs) = left_block(app, tree_area);
     app.tabs = tabs;
     let code_title = code_title(app);
-    let code_block = panel_block(code_title, app.focus == Focus::Code);
-    match app.view {
-        View::Tree => app.tree_panel.area = tree_block.inner(tree_area),
-        View::Ontology => {
-            app.tree_panel.area = Rect::default();
-            app.explorer.area = tree_block.inner(tree_area);
-        }
-    }
+    let (code_block, detail_tabs) = right_block(app, code_title, code_area);
+    app.ins.tabs = detail_tabs;
+    app.tree_panel.area = tree_block.inner(tree_area);
     app.code_panel.area = if app.wide {
         Rect::default()
     } else {
         code_block.inner(code_area)
     };
+    app.ins.area = app.code_panel.area;
 
     app.rebuild(app.tree_panel.area.width as usize, app.code_panel.area.width as usize);
     let (tree_len, code_len) = (app.tree_rows.len(), app.code_rows.len());
@@ -61,29 +49,21 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     draw_header(f, app, header);
     f.render_widget(tree_block, tree_area);
-    match app.view {
-        View::Tree => draw_rows(
-            f,
-            &app.tree_rows,
-            app.tree_panel.area,
-            app.tree_panel.offset,
-            app.tree_panel.sel,
-            app.focus == Focus::Tree,
-        ),
-        View::Ontology => {
-            let message = app.explorer.error.clone().unwrap_or_else(|| {
-                if app.ontology.is_some() {
-                    text::ONTOLOGY_RUNNING.to_string()
-                } else {
-                    text::NO_ONTOLOGY.to_string()
-                }
-            });
-            graph::draw(f, &mut app.explorer, app.focus == Focus::Tree, Some(&message));
-        }
-    }
+    draw_rows(
+        f,
+        &app.tree_rows,
+        app.tree_panel.area,
+        app.tree_panel.offset,
+        app.tree_panel.sel,
+        app.focus == Focus::Tree,
+    );
     if !app.wide {
         f.render_widget(code_block, code_area);
-        draw_code(f, app);
+        if app.ins.detail == Detail::Code {
+            draw_code(f, app);
+        } else {
+            draw_inspector(f, app);
+        }
     }
     draw_footer(f, app, footer);
 
@@ -99,97 +79,131 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             lines.extend(text.lines().map(|l| Line::from(l.to_string())));
             popup(f, text::OVERVIEW_TITLE, lines, scroll);
         }
-        Some(Popup::Filter(cursor)) => {
-            let mut lines = Vec::new();
-            let mut section = "";
-            let mut cursor_line = 0;
-            for (i, (f, count)) in app.explorer.filter_entries().iter().enumerate() {
-                let (title, name) = match f {
-                    Filter::Kind(k) => (text::FILTER_KINDS, k),
-                    Filter::Relation(r) => (text::FILTER_RELATIONS, r),
-                };
-                if title != section {
-                    if !section.is_empty() {
-                        lines.push(Line::default());
-                    }
-                    lines.push(Line::from(Span::styled(
-                        title,
-                        Style::new().add_modifier(Modifier::BOLD),
-                    )));
-                    section = title;
-                }
-                if i == cursor {
-                    cursor_line = lines.len();
-                }
-                let on = app.explorer.filters.contains(f);
-                let row = format!("{} {name}  ({count})", if on { "[x]" } else { "[ ]" });
-                let style = if i == cursor { SEL_FOCUSED } else { Style::new() };
-                lines.push(Line::from(Span::styled(row, style)));
+        Some(Popup::Text(scroll)) => {
+            let lines: Vec<Line> = app.ins.text_body.lines().map(|l| Line::from(l.to_string())).collect();
+            let title = app.ins.text_title.clone();
+            popup(f, &title, lines, scroll);
+        }
+        Some(Popup::Input) => {
+            if let Some(input) = &app.ins.input {
+                input_popup(f, input.kind.title(), &input.text);
             }
-            // Inner height of the popup: the cursor stays on screen.
-            let h = usize::from(f.area().height * 4 / 5).saturating_sub(2).max(1);
-            let scroll = (cursor_line + 1).saturating_sub(h) as u16;
-            popup(f, text::FILTER_TITLE, lines, scroll);
         }
         Some(Popup::Help) => {
             let key = |(k, d): &(&str, &'static str)| {
                 Line::from(vec![Span::styled(format!("{k:<14}"), FOCUS_BORDER), Span::raw(*d)])
             };
-            let mut lines: Vec<Line> = text::HELP.iter().map(key).collect();
-            lines.push(Line::default());
-            lines.push(Line::from(Span::styled(
-                text::HELP_ONTOLOGY_TITLE,
-                Style::new().add_modifier(Modifier::BOLD),
-            )));
-            lines.extend(text::HELP_ONTOLOGY.iter().map(key));
+            let lines: Vec<Line> = text::HELP.iter().map(key).collect();
             popup(f, text::HELP_TITLE, lines, 0);
         }
         None => {}
     }
 }
 
-fn panel_block(title: String, focused: bool) -> Block<'static> {
-    Block::bordered()
+/// Border of the right panel: the tabs of the inspector (with their areas for clicks), the
+/// title of what is shown and, at the bottom, the keys of the current tab.
+fn right_block(app: &App, title: String, area: Rect) -> (Block<'static>, Vec<(Rect, Detail)>) {
+    let mut spans = vec![Span::raw(" ")];
+    let mut tabs = Vec::new();
+    let y = area.y + area.height.saturating_sub(1);
+    let mut x = area.x + 2;
+    for (i, d) in Detail::ALL.into_iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" │ ", DIM));
+            x += 3;
+        }
+        let style = if app.ins.detail == d { TAB_ACTIVE } else { DIM };
+        let span = Span::styled(d.label().to_string(), style);
+        let w = span.width() as u16;
+        tabs.push((Rect::new(x, y, w, 1), d));
+        x += w;
+        spans.push(span);
+    }
+    let hint = format!(" · {} ", app.detail_hint());
+    if x as usize + hint.chars().count() < (area.x + area.width) as usize {
+        spans.push(Span::styled(hint, DIM));
+    }
+    let block = Block::bordered()
         .title(format!(" {title} "))
-        .border_style(if focused { FOCUS_BORDER } else { Style::new() })
+        .title_bottom(Line::from(spans))
+        .border_style(if app.focus == Focus::Code { FOCUS_BORDER } else { Style::new() });
+    (block, tabs)
 }
 
-/// Border of the left panel: tabs `1 Tree │ 2 Ontology` (with their areas for
-/// clicks) and, over the graph, its size.
-fn left_block(app: &App, area: Rect) -> (Block<'static>, Vec<(Rect, View)>) {
-    let tab = |key: &str, name: &str, view: View| {
-        let style = if app.view == view { TAB_ACTIVE } else { DIM };
-        Span::styled(format!("{key} {name}"), style)
-    };
-    let spans = vec![
-        Span::raw(" "),
-        tab("1", text::TAB_TREE, View::Tree),
-        Span::styled(" │ ", DIM),
-        tab("2", text::TAB_ONTOLOGY, View::Ontology),
-        Span::raw(" "),
-    ];
-    let mut tabs = Vec::new();
-    let mut x = area.x + 1;
-    for (i, s) in spans.iter().enumerate() {
-        let w = s.width() as u16;
-        match i {
-            1 => tabs.push((Rect::new(x, area.y, w, 1), View::Tree)),
-            3 => tabs.push((Rect::new(x, area.y, w, 1), View::Ontology)),
-            _ => {}
-        }
-        x += w;
-    }
-    let focused = app.focus == Focus::Tree;
-    let mut block =
-        Block::bordered()
-            .title(Line::from(spans))
-            .border_style(if focused { FOCUS_BORDER } else { Style::new() });
-    if app.view == View::Ontology
-        && let Some(g) = &app.explorer.graph
+/// The inspector: relations, why, contract, example run or comparison of the subject.
+fn draw_inspector(f: &mut Frame, app: &App) {
+    let area = app.ins.area;
+    let visible: Vec<Line> = app
+        .ins
+        .items
+        .iter()
+        .skip(app.ins.scroll)
+        .take(area.height as usize)
+        .map(|i| i.line.clone())
+        .collect();
+    f.render_widget(Paragraph::new(visible), area);
+    if let Some(item) = app.ins.items.get(app.ins.cursor)
+        && item.nav.is_some()
+        && app.ins.cursor >= app.ins.scroll
+        && app.ins.cursor < app.ins.scroll + area.height as usize
     {
-        let size = format!(" {} nodes · {} edges ", g.graph.nodes.len(), g.graph.edges.len());
-        block = block.title_top(Line::from(Span::styled(size, DIM)).right_aligned());
+        let rect = Rect::new(area.x, area.y + (app.ins.cursor - app.ins.scroll) as u16, area.width, 1);
+        f.buffer_mut()
+            .set_style(rect, if app.focus == Focus::Code { SEL_FOCUSED } else { SEL_UNFOCUSED });
     }
+}
+
+/// One-line input in the lower part of the screen.
+fn input_popup(f: &mut Frame, title: &str, text: &str) {
+    let area = f.area();
+    let w = (area.width * 7 / 10).max(30).min(area.width);
+    let rect = Rect {
+        x: area.x + (area.width - w) / 2,
+        y: area.y + area.height * 2 / 3,
+        width: w,
+        height: 3.min(area.height),
+    };
+    f.render_widget(Clear, rect);
+    let block = Block::bordered().title(format!(" {title} · Enter saves, Esc cancels ")).border_style(FOCUS_BORDER);
+    let shown: String = {
+        let keep = (w as usize).saturating_sub(4);
+        let chars: Vec<char> = text.chars().collect();
+        chars[chars.len().saturating_sub(keep)..].iter().collect()
+    };
+    f.render_widget(Paragraph::new(format!("{shown}█")).block(block), rect);
+}
+
+/// Border of the left panel: tabs `1 Tree │ 2 Changes │ ...` (with their areas for
+/// clicks).
+fn left_block(app: &App, area: Rect) -> (Block<'static>, Vec<(Rect, View)>) {
+    let entries = [
+        ("1", text::TAB_TREE, View::Tree),
+        ("2", text::TAB_CHANGES, View::Changes),
+        ("3", text::TAB_WHY, View::Decisions),
+        ("4", text::TAB_CARDS, View::Cards),
+        ("5", text::TAB_CRITERIA, View::Criteria),
+        ("6", text::TAB_ASK, View::Ask),
+    ];
+    let mut spans = vec![Span::raw(" ")];
+    let mut tabs = Vec::new();
+    let mut x = area.x + 1 + 1;
+    for (i, (key, name, view)) in entries.into_iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" │ ", DIM));
+            x += 3;
+        }
+        let style = if app.view == view { TAB_ACTIVE } else { DIM };
+        let span = Span::styled(format!("{key} {name}"), style);
+        let w = span.width() as u16;
+        tabs.push((Rect::new(x, area.y, w, 1), view));
+        x += w;
+        spans.push(span);
+    }
+    spans.push(Span::raw(" "));
+    let focused = app.focus == Focus::Tree;
+    let block = Block::bordered()
+        .title(Line::from(spans))
+        .border_style(if focused { FOCUS_BORDER } else { Style::new() });
     (block, tabs)
 }
 
@@ -220,6 +234,33 @@ fn draw_header(f: &mut Frame, app: &mut App, area: Rect) {
         spans.push(Span::styled(s, DIM));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
+    // Right side: what needs attention, always visible.
+    let mut badges: Vec<Span> = Vec::new();
+    let changed = app
+        .changes
+        .iter()
+        .filter(|c| !matches!(c.status, rekon_core::review::Status::FormatOnly))
+        .count();
+    if changed > 0 {
+        badges.push(Span::styled(format!("Δ{changed} since review"), WARN));
+    }
+    let open = app.ins.decisions.iter().filter(|d| d.status == rekon_core::decisions::Status::Proposed).count();
+    if open > 0 {
+        badges.push(Span::styled(format!("{open} unconfirmed decision(s)"), WARN));
+    }
+    if !app.ins.pins.is_empty() {
+        badges.push(Span::styled(format!("pinned {}", app.ins.pins.len()), DIM));
+    }
+    if !badges.is_empty() {
+        let mut line: Vec<Span> = Vec::new();
+        for (i, b) in badges.into_iter().enumerate() {
+            if i > 0 {
+                line.push(Span::styled("  ·  ", DIM));
+            }
+            line.push(b);
+        }
+        f.render_widget(Paragraph::new(Line::from(line)).right_aligned(), area);
+    }
 }
 
 /// Draws the visible slice of rows and highlights the selected one, together with
@@ -300,8 +341,9 @@ fn draw_footer(f: &mut Frame, app: &mut App, area: Rect) {
     if let Some(p) = &app.init {
         line = format!("init: {} · {line}", p.line());
     }
-    if let Some(p) = &app.ontology {
-        line = format!("{} · {line}", p.line());
+    let hint = app.context_hint();
+    if !hint.is_empty() {
+        line = format!("{hint} · {line}");
     }
     if let Some(n) = &app.notice {
         line = format!("{n} · {line}");
